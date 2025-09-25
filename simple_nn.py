@@ -4,6 +4,7 @@ import torch.optim as optim
 import numpy as np 
 import pandas as pd
 import matplotlib.pyplot as plt
+#This code trains a simple NN for the proprtional controller 
 
 #first grab data from csv
 file = '/Users/jwayment/Code/simple_nonlinear_system/in_out_data.csv'

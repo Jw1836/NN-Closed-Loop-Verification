@@ -1,5 +1,6 @@
 import numpy as np
 import csv
+#This file contains the signal generator, dynamics, controller, and data plotter classes'
 class DotDynamics:
     def __init__(self, x0):
         self.state = x0  # initial state

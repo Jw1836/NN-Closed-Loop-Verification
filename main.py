@@ -1,9 +1,11 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from SignalGenerator import signalGenerator, DotDynamics, Controller
-from SignalGenerator import dataPlotter
+from my_classes import signalGenerator, DotDynamics, Controller
+from my_classes import dataPlotter
 import torch
 import sys
+#This code simulates a closed loop system with a NN controller
+#The NN is trained to mimic a proportional controller u = k*(x_r - x)
 
 class Net(torch.nn.Module):
   def __init__(self):

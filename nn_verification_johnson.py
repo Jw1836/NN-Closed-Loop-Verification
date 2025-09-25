@@ -3,7 +3,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import sys
-
+#This code verifies the NN robustness by perturbing the inputs
+#and then calculating the reachable sets
+#This method is the open loop verification method from Dr. Johnson's paper
 def purelin(x):
     return x
 def nn_function(x, W1, theta1, W2, theta2):
