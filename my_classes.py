@@ -15,7 +15,7 @@ class DotDynamics:
 
     def f(self, state, u): #this is x_dot = f(x, u)
         # nonlinear dynamics
-        return state**2 + u
+        return 1 - state**2 + u
     
     def rk4_step(self, u):
         # Integrate ODE using Runge-Kutta RK4 algorithm
@@ -35,11 +35,11 @@ class Controller:
         e = x - x_r  # tracking error
         u = self.k * e  # control law
         in_out_pair = [e, u]
-        #self.write_to_file(in_out_pair)
+        self.write_to_file(in_out_pair)
         return u
     
     def write_to_file(self, data):
-        file = '/Users/jwayment/Code/simple_nonlinear_system/in_out_data.csv'
+        file = '/Users/jwayment/Code/NN-Closed-Loop-Verification/in_out_data.csv'
         try:
             with open(file, 'a', newline='') as csvfile:
                 writer = csv.writer(csvfile)

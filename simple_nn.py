@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 #This code trains a simple NN for the proprtional controller 
 
 #first grab data from csv
-file = '/Users/jwayment/Code/simple_nonlinear_system/in_out_data.csv'
+file = '/Users/jwayment/Code/NN-Closed-Loop-Verification/in_out_data.csv'
 data = pd.read_csv(file, header=None)
 data.columns = ['error', 'control']
 
@@ -54,4 +54,4 @@ for epoch in range(1000):
 
 print(model(torch.tensor([[.0055]])))
 print(-20 * .0055)
-torch.save(model.state_dict(), "/Users/jwayment/Code/simple_nonlinear_system/my_model.pth")
+torch.save(model.state_dict(), "/Users/jwayment/Code/NN-Closed-Loop-Verification/my_model.pth")

@@ -20,14 +20,14 @@ class Net(torch.nn.Module):
 
 #GRAB NN MODEL
 model = Net()
-model.load_state_dict(torch.load("/Users/jwayment/Code/simple_nonlinear_system/my_model.pth"))
+model.load_state_dict(torch.load("/Users/jwayment/Code/NN-Closed-Loop-Verification/my_model.pth"))
 model.eval()  # Set to evaluation mode
 # print(model(torch.tensor([[.0055]])))
 # sys.exit()
-#Given a nonlinear system, x\dot = x^2 + u, y = x
+#Given a nonlinear system, x\dot = 1 - x^2 + u, y = x
 #test out controller u = k*(x_r - x)
 k = -20
-dot = DotDynamics(x0=0)
+dot = DotDynamics(x0=30)
 controller = Controller(k=k)
 ref = signalGenerator(amplitude=1, frequency=0.01, y_offset=0)
 dataPlot = dataPlotter()
@@ -43,7 +43,8 @@ while t < sim_time:  # main simulation loop
 
     # updates control and dynamics at faster simulation rate
     while t < t_next_plot: 
-        r = ref.square(t)
+        #r = ref.sin(t) * 1
+        r = 1
         x = dot.state
         #u = controller.update(r, x)  # update controller
         #use nn
