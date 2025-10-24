@@ -56,7 +56,7 @@ net = NeuralLyapunov(num_hidden_layers=4)
 
 # ----- 3. Create 1D grid points -----
 # 1D grid over [0, 2]
-x = torch.linspace(-20, 20, 500).unsqueeze(1)
+x = torch.linspace(-5, 5, 500).unsqueeze(1)
 x.requires_grad_(True)
 
 
