@@ -19,10 +19,12 @@ import igraph as ig
 
 # ── Geometry helpers ───────────────────────────────────────────────────────────
 
+
 def is_within_rect(point, x1_min, x1_max, x2_min, x2_max, tol=1e-8):
     """Return True if point lies inside (or on) the axis-aligned rectangle."""
-    return (x1_min - tol <= point[0] <= x1_max + tol) and \
-           (x2_min - tol <= point[1] <= x2_max + tol)
+    return (x1_min - tol <= point[0] <= x1_max + tol) and (
+        x2_min - tol <= point[1] <= x2_max + tol
+    )
 
 
 def find_intersection(plane_1_normal, plane_1_bias, plane_2_normal, plane_2_bias):
@@ -40,8 +42,9 @@ def find_intersection(plane_1_normal, plane_1_bias, plane_2_normal, plane_2_bias
     return np.linalg.solve(A, b)
 
 
-def find_all_intersection_points(W_matrix, B_vector, f_functions,
-                                 x1_min, x1_max, x2_min, x2_max):
+def find_all_intersection_points(
+    W_matrix, B_vector, f_functions, x1_min, x1_max, x2_min, x2_max
+):
     """Find all pairwise intersections of ReLU hyperplanes, plus their
     intersections with the four domain edges, clipped to the rectangle.
 
@@ -95,30 +98,38 @@ def find_all_intersection_points(W_matrix, B_vector, f_functions,
             intersection_points.append(pt)
 
     # Add the four rectangle corners
-    for corner in [(x1_min, x2_min), (x1_min, x2_max),
-                   (x1_max, x2_min), (x1_max, x2_max)]:
+    for corner in [
+        (x1_min, x2_min),
+        (x1_min, x2_max),
+        (x1_max, x2_min),
+        (x1_max, x2_max),
+    ]:
         intersection_points.append(corner)
 
     # Discard any points that fell outside the rectangle
-    return [p for p in intersection_points
-            if is_within_rect(p, x1_min, x1_max, x2_min, x2_max)]
+    return [
+        p
+        for p in intersection_points
+        if is_within_rect(p, x1_min, x1_max, x2_min, x2_max)
+    ]
 
 
 def _connect_consecutive_on_edge(points_on_edge, edge_name, edge_list):
     """Sort points along one rectangle edge and connect consecutive pairs."""
     if len(points_on_edge) < 2:
         return edge_list
-    if edge_name in ('left', 'right'):
-        points_on_edge.sort(key=lambda p: p[1][1])   # sort by x2
+    if edge_name in ("left", "right"):
+        points_on_edge.sort(key=lambda p: p[1][1])  # sort by x2
     else:
-        points_on_edge.sort(key=lambda p: p[1][0])   # sort by x1 
+        points_on_edge.sort(key=lambda p: p[1][0])  # sort by x1
     for k in range(len(points_on_edge) - 1):
         edge_list.append((points_on_edge[k][0], points_on_edge[k + 1][0]))
     return edge_list
 
 
-def get_planar_graph(intersection_points, W_matrix, B_vector,
-                     x1_min, x1_max, x2_min, x2_max, tol=1e-6):
+def get_planar_graph(
+    intersection_points, W_matrix, B_vector, x1_min, x1_max, x2_min, x2_max, tol=1e-6
+):
     """Build the planar graph whose vertices are the intersection points.
 
     Returns
@@ -128,15 +139,16 @@ def get_planar_graph(intersection_points, W_matrix, B_vector,
     edge_list : list of (str, str) tuples
         Edges between vertex labels.
     """
-    vertex_dict = {f'v{i}': intersection_points[i]
-                   for i in range(len(intersection_points))}
+    vertex_dict = {
+        f"v{i}": intersection_points[i] for i in range(len(intersection_points))
+    }
     edge_list = []
 
     # Collect points on each rectangle edge for boundary connectivity
     left_pts, right_pts, bottom_pts, top_pts = [], [], [], []
     for i, pt in enumerate(intersection_points):
         x1, x2 = pt[0], pt[1]
-        label = (f'v{i}', pt)
+        label = (f"v{i}", pt)
         if abs(x1 - x1_min) < tol:
             left_pts.append(label)
         if abs(x1 - x1_max) < tol:
@@ -146,18 +158,21 @@ def get_planar_graph(intersection_points, W_matrix, B_vector,
         if abs(x2 - x2_max) < tol:
             top_pts.append(label)
 
-    edge_list = _connect_consecutive_on_edge(left_pts,   'left',   edge_list)
-    edge_list = _connect_consecutive_on_edge(right_pts,  'right',  edge_list)
-    edge_list = _connect_consecutive_on_edge(bottom_pts, 'bottom', edge_list)
-    edge_list = _connect_consecutive_on_edge(top_pts,    'top',    edge_list)
+    edge_list = _connect_consecutive_on_edge(left_pts, "left", edge_list)
+    edge_list = _connect_consecutive_on_edge(right_pts, "right", edge_list)
+    edge_list = _connect_consecutive_on_edge(bottom_pts, "bottom", edge_list)
+    edge_list = _connect_consecutive_on_edge(top_pts, "top", edge_list)
 
     # Connect points that lie on the same ReLU hyperplane
     for plane_idx in range(W_matrix.shape[1]):
         w_i = W_matrix[:, plane_idx]
         b_i = B_vector[plane_idx]
 
-        on_plane = [(i, pt) for i, pt in enumerate(intersection_points)
-                    if abs(np.dot(pt, w_i) + b_i) < tol]
+        on_plane = [
+            (i, pt)
+            for i, pt in enumerate(intersection_points)
+            if abs(np.dot(pt, w_i) + b_i) < tol
+        ]
 
         # Sort along the plane: if the normal is more horizontal, sort by x2
         if abs(w_i[0]) > abs(w_i[1]):
@@ -166,20 +181,21 @@ def get_planar_graph(intersection_points, W_matrix, B_vector,
             on_plane.sort(key=lambda p: p[1][0])
 
         for k in range(len(on_plane) - 1):
-            edge_list.append((f'v{on_plane[k][0]}', f'v{on_plane[k + 1][0]}'))
+            edge_list.append((f"v{on_plane[k][0]}", f"v{on_plane[k + 1][0]}"))
 
     return vertex_dict, edge_list
 
 
 # ── Graph / polygon extraction ─────────────────────────────────────────────────
 
+
 def ordered_nodes_from_cycle_edges(g_ig, cycle_edge_indices):
     """Convert a cycle (given as igraph edge indices) to an ordered node list."""
     cycle_edges = []
     for idx in cycle_edge_indices:
         e = g_ig.es[idx]
-        u = g_ig.vs[e.source]['_nx_name']
-        v = g_ig.vs[e.target]['_nx_name']
+        u = g_ig.vs[e.source]["_nx_name"]
+        v = g_ig.vs[e.target]["_nx_name"]
         cycle_edges.append((u, v))
 
     adjacency = {}
@@ -204,7 +220,7 @@ def ordered_nodes_from_cycle_edges(g_ig, cycle_edge_indices):
             break
         ordered.append(next_node)
         prev, current = current, next_node
-        if len(ordered) > len(adjacency):   # safety guard
+        if len(ordered) > len(adjacency):  # safety guard
             break
 
     if len(set(ordered)) != len(adjacency):
@@ -225,6 +241,7 @@ def polygons_from_igraph_mcb(g_ig):
 
 # ── Neural network utilities ───────────────────────────────────────────────────
 
+
 def _step(x):
     """Heaviside step function."""
     return 1 if x >= 0 else 0
@@ -243,23 +260,31 @@ def analytic_gradient(model, input_num, hidden_num, x_state):
     hidden_num : int
     x_state : array-like, shape (input_num, 1)
     """
-    W_matrix  = model.network[0].weight.detach().numpy().T   # (input_dim, hidden_dim)
-    B_vector  = model.network[0].bias.detach().numpy()       # (hidden_dim,)
+    W_matrix = model.network[0].weight.detach().numpy().T  # (input_dim, hidden_dim)
+    B_vector = model.network[0].bias.detach().numpy()  # (hidden_dim,)
     W_out_vec = model.network[2].weight.detach().numpy().flatten()  # (hidden_dim,)
     W_out_mat = np.diag(W_out_vec)
 
+    # Flatten to 1-D so dot products always return scalars, regardless of
+    # whether x_state was passed as (n,) or (n, 1).
+    x_flat = np.asarray(x_state).flatten()
+
     # Activation pattern at x_state
-    U = np.array([[_step(np.dot(W_matrix[:, i], x_state) + B_vector[i])]
-                  for i in range(hidden_num)])          # (hidden_dim, 1)
+    U = np.array(
+        [
+            [_step(np.dot(W_matrix[:, i], x_flat) + B_vector[i])]
+            for i in range(hidden_num)
+        ]
+    )  # (hidden_dim, 1)
 
     grad = np.zeros((input_num, 1))
     for i in range(input_num):
         W_prime = W_out_mat @ W_matrix[i, :].reshape(-1, 1)
-        grad[i] = float(U.T @ W_prime)
+        grad[i] = (U.T @ W_prime).item()  # (1,1) → scalar
     return grad
 
 
-def verify_point(model, input_dim, hidden_dim, x1_val, x2_val, dynamics_list)->bool:
+def verify_point(model, input_dim, hidden_dim, x1_val, x2_val, dynamics_list) -> bool:
     """Return True if the Lie derivative V_dot < 0 at (x1_val, x2_val)."""
     x = np.array([[x1_val], [x2_val]])
     grad = analytic_gradient(model, input_dim, hidden_dim, x)
@@ -269,6 +294,7 @@ def verify_point(model, input_dim, hidden_dim, x1_val, x2_val, dynamics_list)->b
 
 
 # ── Polygon geometry helpers ───────────────────────────────────────────────────
+
 
 def is_point_in_polygon(x, y, polygon_vertices):
     """Ray-casting test: True if (x, y) is strictly inside the polygon."""
@@ -286,7 +312,7 @@ def is_point_in_polygon(x, y, polygon_vertices):
     return (intersections % 2) == 1
 
 
-def zero_level_set_crosses_edge(v1, v2, f_function)->bool:
+def zero_level_set_crosses_edge(v1, v2, f_function) -> bool:
     """Return True if the zero level set of f_function crosses the edge v1→v2."""
     x1_min_e = min(v1[0], v2[0])
     x1_max_e = max(v1[0], v2[0])
@@ -304,7 +330,7 @@ def zero_level_set_crosses_edge(v1, v2, f_function)->bool:
     x2_diff = x2_max_e - x2_min_e
     steps = max(int(max(x1_diff, x2_diff) * 10), 100)
 
-    if abs(v2[0] - v1[0]) < 1e-10:   # vertical edge
+    if abs(v2[0] - v1[0]) < 1e-10:  # vertical edge
         x1_on_edge = np.full(steps, v1[0])
         x2_on_edge = np.linspace(x2_min_e, x2_max_e, steps)
     else:
@@ -312,8 +338,9 @@ def zero_level_set_crosses_edge(v1, v2, f_function)->bool:
         x1_on_edge = v1[0] + t * (v2[0] - v1[0])
         x2_on_edge = v1[1] + t * (v2[1] - v1[1])
 
-    f_on_edge = np.array([f_function(np.array([[x1], [x2]]))
-                          for x1, x2 in zip(x1_on_edge, x2_on_edge)])
+    f_on_edge = np.array(
+        [f_function(np.array([[x1], [x2]])) for x1, x2 in zip(x1_on_edge, x2_on_edge)]
+    )
     return len(np.where(np.diff(np.sign(f_on_edge)) != 0)[0]) > 0
 
 
@@ -329,9 +356,12 @@ def amsden_hirt_grid(polygon_vertices, N1, N2, max_iter=250, tol=1e-6):
     total_pts = 2 * N1 + 2 * N2 - 4
 
     # Compute per-edge arc lengths
-    lengths = [np.linalg.norm(np.array(polygon_vertices[i + 1]) -
-                               np.array(polygon_vertices[i]))
-               for i in range(len(polygon_vertices) - 1)]
+    lengths = [
+        np.linalg.norm(
+            np.array(polygon_vertices[i + 1]) - np.array(polygon_vertices[i])
+        )
+        for i in range(len(polygon_vertices) - 1)
+    ]
     perimeter = sum(lengths)
 
     # Distribute boundary points proportionally to edge length
@@ -362,20 +392,24 @@ def amsden_hirt_grid(polygon_vertices, N1, N2, max_iter=250, tol=1e-6):
     X = np.zeros((N1, N2), dtype=float)
     Y = np.zeros((N1, N2), dtype=float)
     k = 0
-    for i in range(N1):                  # bottom (j=0)
-        X[i, 0], Y[i, 0] = boundary_pts[k]; k += 1
-    for j in range(1, N1 - 1):          # right (i=N1-1)
-        X[N1 - 1, j], Y[N1 - 1, j] = boundary_pts[k]; k += 1
-    for i in range(N1 - 1, -1, -1):     # top (j=N2-1)
-        X[i, N2 - 1], Y[i, N2 - 1] = boundary_pts[k]; k += 1
-    for j in range(N2 - 2, 0, -1):      # left (i=0)
-        X[0, j], Y[0, j] = boundary_pts[k]; k += 1
+    for i in range(N1):  # bottom (j=0)
+        X[i, 0], Y[i, 0] = boundary_pts[k]
+        k += 1
+    for j in range(1, N1 - 1):  # right (i=N1-1)
+        X[N1 - 1, j], Y[N1 - 1, j] = boundary_pts[k]
+        k += 1
+    for i in range(N1 - 1, -1, -1):  # top (j=N2-1)
+        X[i, N2 - 1], Y[i, N2 - 1] = boundary_pts[k]
+        k += 1
+    for j in range(N2 - 2, 0, -1):  # left (i=0)
+        X[0, j], Y[0, j] = boundary_pts[k]
+        k += 1
 
     # Initial interior guess: bilinear interpolation between left/right boundaries
     for j in range(1, N2 - 1):
         for i in range(1, N1 - 1):
             s = i / (N1 - 1)
-            xL, yL = X[0, j],      Y[0, j]
+            xL, yL = X[0, j], Y[0, j]
             xR, yR = X[N1 - 1, j], Y[N1 - 1, j]
             X[i, j] = (1 - s) * xL + s * xR
             Y[i, j] = (1 - s) * yL + s * yR
@@ -387,14 +421,15 @@ def amsden_hirt_grid(polygon_vertices, N1, N2, max_iter=250, tol=1e-6):
         max_diff = 0.0
         for i in range(1, N1 - 1):
             for j in range(1, N2 - 1):
-                x_new = 0.25 * (prev_X[i+1, j] + X[i-1, j] +
-                                 prev_X[i, j+1] + X[i, j-1])
-                y_new = 0.25 * (prev_Y[i+1, j] + Y[i-1, j] +
-                                 prev_Y[i, j+1] + Y[i, j-1])
+                x_new = 0.25 * (
+                    prev_X[i + 1, j] + X[i - 1, j] + prev_X[i, j + 1] + X[i, j - 1]
+                )
+                y_new = 0.25 * (
+                    prev_Y[i + 1, j] + Y[i - 1, j] + prev_Y[i, j + 1] + Y[i, j - 1]
+                )
                 X[i, j] = omega * x_new + (1 - omega) * prev_X[i, j]
                 Y[i, j] = omega * y_new + (1 - omega) * prev_Y[i, j]
-                diff = max(abs(prev_X[i, j] - X[i, j]),
-                           abs(prev_Y[i, j] - Y[i, j]))
+                diff = max(abs(prev_X[i, j] - X[i, j]), abs(prev_Y[i, j] - Y[i, j]))
                 if diff > max_diff:
                     max_diff = diff
         if max_diff < tol:
@@ -406,6 +441,7 @@ def amsden_hirt_grid(polygon_vertices, N1, N2, max_iter=250, tol=1e-6):
 
 
 # ── Polygon class ──────────────────────────────────────────────────────────────
+
 
 class Polygon:
     """A single face of the ReLU hyperplane arrangement.
@@ -419,7 +455,7 @@ class Polygon:
     """
 
     def __init__(self, vertex_names, vertex_dict):
-        self.vertex_names  = vertex_names
+        self.vertex_names = vertex_names
         self.vertex_coords = [vertex_dict[v] for v in vertex_names]
 
     @property
@@ -443,8 +479,7 @@ class Polygon:
             Rotation matrix.
         """
         theta = -np.arctan2(gradient_vec[1][0], gradient_vec[0][0])
-        R = np.array([[np.cos(theta), -np.sin(theta)],
-                      [np.sin(theta),  np.cos(theta)]])
+        R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
         return theta, R
 
     def check_gradient(self, model, input_dim, hidden_dim, f1, f2):
@@ -541,16 +576,26 @@ class Polygon:
             counter += 1
 
         # Counterexamples: regions where rotated f1 > 0  (V_dot >= 0)
-        return [representative_pts[j]
-                for j, signs in enumerate(sign_list)
-                if signs[0] > 0]
+        return [
+            representative_pts[j] for j, signs in enumerate(sign_list) if signs[0] > 0
+        ]
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
-def full_method(my_nn, input_dim, hidden_layer_size, output_dim,
-                zero_level_functions, dynamics_list,
-                x1_min, x1_max, x2_min, x2_max):
+
+def full_method(
+    my_nn,
+    input_dim,
+    hidden_layer_size,
+    output_dim,
+    zero_level_functions,
+    dynamics_list,
+    x1_min,
+    x1_max,
+    x2_min,
+    x2_max,
+):
     """End-to-end hyperplane verification pipeline.
 
     Parameters
@@ -580,17 +625,28 @@ def full_method(my_nn, input_dim, hidden_layer_size, output_dim,
     print("Getting intersection points...")
     t0 = time.perf_counter()
     intersection_points = find_all_intersection_points(
-        W_matrix, B_vector, zero_level_functions,
-        x1_min, x1_max, x2_min, x2_max,
+        W_matrix,
+        B_vector,
+        zero_level_functions,
+        x1_min,
+        x1_max,
+        x2_min,
+        x2_max,
     )
-    print(f"  done ({time.perf_counter() - t0:.3f}s)  "
-          f"— {len(intersection_points)} points")
+    print(
+        f"  done ({time.perf_counter() - t0:.3f}s)  — {len(intersection_points)} points"
+    )
 
     print("Building planar graph...")
     t0 = time.perf_counter()
     vertex_dict, edge_list = get_planar_graph(
-        intersection_points, W_matrix, B_vector,
-        x1_min, x1_max, x2_min, x2_max,
+        intersection_points,
+        W_matrix,
+        B_vector,
+        x1_min,
+        x1_max,
+        x2_min,
+        x2_max,
     )
     G = nx.Graph()
     G.add_nodes_from(vertex_dict.keys())
@@ -601,20 +657,27 @@ def full_method(my_nn, input_dim, hidden_layer_size, output_dim,
     t0 = time.perf_counter()
     g_ig = ig.Graph.from_networkx(G)
     polygon_node_lists = polygons_from_igraph_mcb(g_ig)
-    print(f"  done ({time.perf_counter() - t0:.3f}s)  "
-          f"— {len(polygon_node_lists)} polygons")
+    print(
+        f"  done ({time.perf_counter() - t0:.3f}s)  "
+        f"— {len(polygon_node_lists)} polygons"
+    )
 
     print("Running verification...")
     t0 = time.perf_counter()
     counterexamples = []
     for node_list in polygon_node_lists:
         poly = Polygon(node_list, vertex_dict)
-        cex  = poly.check_gradient(
-            my_nn, input_dim, hidden_layer_size,
-            dynamics_list[0], dynamics_list[1],
+        cex = poly.check_gradient(
+            my_nn,
+            input_dim,
+            hidden_layer_size,
+            dynamics_list[0],
+            dynamics_list[1],
         )
         counterexamples.extend(cex)
-    print(f"  done ({time.perf_counter() - t0:.3f}s)  "
-          f"— {len(counterexamples)} counterexamples")
+    print(
+        f"  done ({time.perf_counter() - t0:.3f}s)  "
+        f"— {len(counterexamples)} counterexamples"
+    )
 
     return counterexamples, polygon_node_lists, vertex_dict
