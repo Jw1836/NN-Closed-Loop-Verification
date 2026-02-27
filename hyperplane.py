@@ -15,6 +15,8 @@ import time
 import numpy as np
 import networkx as nx
 import igraph as ig
+import torch
+from torch import nn, Tensor
 
 
 # ── Geometry helpers ───────────────────────────────────────────────────────────
@@ -42,9 +44,7 @@ def find_intersection(plane_1_normal, plane_1_bias, plane_2_normal, plane_2_bias
     return np.linalg.solve(A, b)
 
 
-def find_all_intersection_points(
-    W_matrix, B_vector, f_functions, x1_min, x1_max, x2_min, x2_max
-):
+def find_all_intersection_points(W_matrix, B_vector, x1_min, x1_max, x2_min, x2_max):
     """Find all pairwise intersections of ReLU hyperplanes, plus their
     intersections with the four domain edges, clipped to the rectangle.
 
@@ -54,8 +54,6 @@ def find_all_intersection_points(
         Columns are weight vectors into each hidden neuron.
     B_vector : ndarray, shape (hidden_dim,)
         Biases of the hidden layer.
-    f_functions : list
-        Zero-level-set functions (currently unused, kept for API compatibility).
     x1_min, x1_max, x2_min, x2_max : float
         Domain bounds.
     """
@@ -284,12 +282,20 @@ def analytic_gradient(model, input_num, hidden_num, x_state):
     return grad
 
 
-def verify_point(model, input_dim, hidden_dim, x1_val, x2_val, dynamics_list) -> bool:
+def _dynamics_numpy(dynamics: nn.Module, x: np.ndarray):
+    """Evaluate dynamics at a (2, 1) numpy column vector; returns (f1, f2) floats."""
+    t = torch.tensor([[x[0, 0], x[1, 0]]], dtype=torch.float32)
+    out = dynamics(t)
+    return float(out[0, 0]), float(out[0, 1])
+
+
+def verify_point(
+    model, input_dim, hidden_dim, x1_val, x2_val, dynamics: nn.Module
+) -> bool:
     """Return True if the Lie derivative V_dot < 0 at (x1_val, x2_val)."""
     x = np.array([[x1_val], [x2_val]])
     grad = analytic_gradient(model, input_dim, hidden_dim, x)
-    f1 = dynamics_list[0](x)
-    f2 = dynamics_list[1](x)
+    f1, f2 = _dynamics_numpy(dynamics, x)
     return float(grad[0] * f1 + grad[1] * f2) < 0
 
 
@@ -482,7 +488,7 @@ class Polygon:
         R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
         return theta, R
 
-    def check_gradient(self, model, input_dim, hidden_dim, f1, f2):
+    def check_gradient(self, model, input_dim, hidden_dim, dynamics: nn.Module):
         """Find counterexample points inside this polygon.
 
         Computes the analytic gradient at the centroid, rotates the coordinate
@@ -496,8 +502,7 @@ class Polygon:
         ----------
         model : nn.Module
         input_dim, hidden_dim : int
-        f1, f2 : callable
-            System dynamics  x_dot = [f1(x), f2(x)].
+        dynamics : nn.Module
 
         Returns
         -------
@@ -513,6 +518,13 @@ class Polygon:
         # Sanity check: rotated gradient should be close to E_1
         if np.dot(rotated_U.T, E_2) > 1e-3 and rotated_U[0][0] < 0:
             print("Warning: rotated gradient is not close to E_1")
+
+        # Component callables from dynamics module
+        def f1(x):
+            return _dynamics_numpy(dynamics, x)[0]
+
+        def f2(x):
+            return _dynamics_numpy(dynamics, x)[1]
 
         # Rotated dynamics
         def rf1(x):
@@ -585,33 +597,21 @@ class Polygon:
 
 
 def full_method(
-    my_nn,
-    input_dim,
-    hidden_layer_size,
-    output_dim,
-    zero_level_functions,
-    dynamics_list,
-    x1_min,
-    x1_max,
-    x2_min,
-    x2_max,
-):
+    net: nn.Module,
+    dynamics: nn.Module,
+    region: Tensor,
+) -> tuple[list, list, dict]:
     """End-to-end hyperplane verification pipeline.
 
     Parameters
     ----------
-    my_nn : nn.Module
+    net : nn.Module
         Single-hidden-layer ReLU network (network[0]=Linear, network[1]=ReLU,
         network[2]=Linear).
-    input_dim : int
-    hidden_layer_size : int
-    output_dim : int
-    zero_level_functions : list
-        Zero-level-set functions for the domain boundaries (API compatibility).
-    dynamics_list : list of callable
-        [f1, f2] where x_dot = [f1(x), f2(x)].
-    x1_min, x1_max, x2_min, x2_max : float
-        Domain bounds.
+    dynamics : nn.Module
+        System dynamics; forward(x) returns dx with shape (N, 2).
+    region : Tensor, shape (2, 2)
+        Domain bounds [[x1_min, x1_max], [x2_min, x2_max]].
 
     Returns
     -------
@@ -619,15 +619,18 @@ def full_method(
     polygons : list of list[str]   (ordered vertex-name lists)
     vertex_dict : dict[str, array-like]
     """
-    W_matrix = my_nn.network[0].weight.detach().numpy().T
-    B_vector = my_nn.network[0].bias.detach().numpy()
+    x1_min, x1_max = region[0, 0].item(), region[0, 1].item()
+    x2_min, x2_max = region[1, 0].item(), region[1, 1].item()
+
+    W_matrix = net.network[0].weight.detach().numpy().T  # (input_dim, hidden_dim)
+    B_vector = net.network[0].bias.detach().numpy()
+    input_dim, hidden_layer_size = W_matrix.shape
 
     print("Getting intersection points...")
     t0 = time.perf_counter()
     intersection_points = find_all_intersection_points(
         W_matrix,
         B_vector,
-        zero_level_functions,
         x1_min,
         x1_max,
         x2_min,
@@ -668,11 +671,10 @@ def full_method(
     for node_list in polygon_node_lists:
         poly = Polygon(node_list, vertex_dict)
         cex = poly.check_gradient(
-            my_nn,
+            net,
             input_dim,
             hidden_layer_size,
-            dynamics_list[0],
-            dynamics_list[1],
+            dynamics,
         )
         counterexamples.extend(cex)
     print(

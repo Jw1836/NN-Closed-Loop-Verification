@@ -18,16 +18,8 @@ class LyapunovProblem:
     dynamics: nn.Module
     region: Tensor
 
-    f: List[Callable]
-    domain: Tuple[Tuple[float, float], ...]
-    x_star: np.ndarray
-    dim: int
-    analytic_V: Optional[Callable] = None
-    analytic_V_gradient: Optional[Callable] = None
-    zero_level_set_funcs: Optional[List[Callable]] = None
 
-
-def lyapunov_loss_function(x_train_2d, practice_nn, f1_torch, f2_torch):
+def lyapunov_loss_function(x_train_2d, practice_nn, dynamics: nn.Module):
     """Composite Lyapunov training loss.
 
     Penalises:
@@ -55,7 +47,8 @@ def lyapunov_loss_function(x_train_2d, practice_nn, f1_torch, f2_torch):
         grad_outputs=torch.ones_like(V_x),
         create_graph=True,
     )[0]
-    f_vec = torch.cat([f1_torch(x_train_2d), f2_torch(x_train_2d)], dim=1)
+    with torch.no_grad():
+        f_vec = dynamics(x_train_2d)
     lie_derivative = torch.sum(grad_V * f_vec, dim=1)
     lie_penalty = torch.relu(lie_derivative + 1e-6).mean()
 
@@ -67,14 +60,14 @@ def lyapunov_loss_function(x_train_2d, practice_nn, f1_torch, f2_torch):
 
 
 def train_model_lyapunov_general(
-    model, x_train_2d, num_epochs, learning_rate, f1_torch, f2_torch
+    model, x_train_2d, num_epochs, learning_rate, dynamics: nn.Module
 ):
     """Train a neural Lyapunov function using the composite Lyapunov loss."""
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     for epoch in range(num_epochs):
         model.train()
         optimizer.zero_grad()
-        loss = lyapunov_loss_function(x_train_2d, model, f1_torch, f2_torch)
+        loss = lyapunov_loss_function(x_train_2d, model, dynamics)
         loss.backward()
         optimizer.step()
         if (epoch + 1) % 100 == 0:
