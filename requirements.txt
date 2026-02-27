@@ -1,8 +1,11 @@
 torch
+pandas
 numpy
 matplotlib
-plotly
-scipy
 control
 igraph
 networkx
+plotly
+scipy
+sympy
+z3-solver
