@@ -64,7 +64,9 @@ def check_greater_zero(
     return result
 
 
-def verify_lyapunov_nn(problem: LyapunovProblem, device: str = "cpu") -> dict[str, Any]:
+def verify_lyapunov_nn(
+    problem: LyapunovProblem, device: torch.device = torch.device("cpu")
+) -> dict[str, Any]:
     # Dict to store verification result
     verification_result = {}
 

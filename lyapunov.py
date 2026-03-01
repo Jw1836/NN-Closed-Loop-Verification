@@ -22,6 +22,19 @@ class LyapunovProblem:
     def state_dim(self) -> int:
         return self.region.shape[0]
 
+    def __repr__(self) -> str:
+        region_str = ", ".join(
+            f"x{i + 1} ∈ [{self.region[i, 0].item():.3g}, {self.region[i, 1].item():.3g}]"
+            for i in range(self.state_dim)
+        )
+        return (
+            f"{self.__class__.__name__}("
+            f"state_dim={self.state_dim}, "
+            f"region=[{region_str}], "
+            f"lyapunov={self.nn_lyapunov.__class__.__name__}, "
+            f"dynamics={self.dynamics.__class__.__name__})"
+        )
+
 
 def lyapunov_loss_function(x_train_2d, practice_nn, dynamics: nn.Module):
     """Composite Lyapunov training loss.
