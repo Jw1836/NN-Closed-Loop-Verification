@@ -488,7 +488,14 @@ class Polygon:
         R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
         return theta, R
 
-    def check_gradient(self, model, input_dim, hidden_dim, dynamics: nn.Module):
+    def check_gradient(
+        self,
+        model,
+        input_dim,
+        hidden_dim,
+        dynamics: nn.Module,
+        max_refinements: int = 10,
+    ):
         """Find counterexample points inside this polygon.
 
         Computes the analytic gradient at the centroid, rotates the coordinate
@@ -503,6 +510,8 @@ class Polygon:
         model : nn.Module
         input_dim, hidden_dim : int
         dynamics : nn.Module
+        max_refinements : int
+            Maximum grid refinement iterations when searching for sign regions.
 
         Returns
         -------
@@ -563,7 +572,7 @@ class Polygon:
         sign_list = []
         representative_pts = []
 
-        while found_count < num_regions:
+        while found_count < num_regions and counter < max_refinements:
             # Pass a copy so amsden_hirt_grid's append doesn't corrupt our list
             X_grid, Y_grid = amsden_hirt_grid(
                 list(self.vertex_coords),
@@ -586,6 +595,13 @@ class Polygon:
                 if found_count == num_regions:
                     break
             counter += 1
+
+        if found_count < num_regions:
+            print(
+                f"Warning: found {found_count}/{num_regions} sign regions after "
+                f"{counter} refinements at centroid "
+                f"({self.centroid[0]:.4f}, {self.centroid[1]:.4f})"
+            )
 
         # Counterexamples: regions where rotated f1 > 0  (V_dot >= 0)
         return [
