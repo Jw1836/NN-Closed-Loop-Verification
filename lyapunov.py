@@ -18,6 +18,10 @@ class LyapunovProblem:
     dynamics: nn.Module
     region: Tensor
 
+    @property
+    def state_dim(self) -> int:
+        return self.region.shape[0]
+
 
 def lyapunov_loss_function(x_train_2d, practice_nn, dynamics: nn.Module):
     """Composite Lyapunov training loss.

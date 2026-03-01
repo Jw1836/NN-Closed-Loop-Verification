@@ -15,7 +15,7 @@ from torch import nn, Tensor
 from lyapunov import LyapunovProblem
 
 # REGION OF INTEREST: [[x1_min, x1_max], [x2_min, x2_max]]
-REGION: Tensor = torch.tensor([[-3.0, 3.0], [-3.0, 3.0]])
+REGION: Tensor = torch.tensor([[-1.0, 1.0], [-1.0, 1.0]])
 
 # Default Duffing parameters
 DELTA: float = 1.0
