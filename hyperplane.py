@@ -358,7 +358,8 @@ def amsden_hirt_grid(polygon_vertices, N1, N2, max_iter=250, tol=1e-6):
     """
     polygon_vertices.append(polygon_vertices[0])  # close the polygon
 
-    omega = 4 / (2 + np.sqrt(4 - (np.cos(np.pi / N1) + np.cos(np.pi / N2) ** 2)))
+    #omega = 4 / (2 + np.sqrt(4 - (np.cos(np.pi / N1) + np.cos(np.pi / N2) ** 2)))
+    omega = 4 / (2 + np.sqrt(4 - (np.cos(np.pi / N1) + np.cos(np.pi / N2)) ** 2))
     total_pts = 2 * N1 + 2 * N2 - 4
 
     # Compute per-edge arc lengths
@@ -405,7 +406,7 @@ def amsden_hirt_grid(polygon_vertices, N1, N2, max_iter=250, tol=1e-6):
         X[N1 - 1, j], Y[N1 - 1, j] = boundary_pts[k]
         k += 1
     for i in range(N1 - 1, -1, -1):  # top (j=N2-1)
-        X[i, N2 - 1], Y[i, N1 - 1] = boundary_pts[k]
+        X[i, N2 - 1], Y[i, N2 - 1] = boundary_pts[k]
         k += 1
     for j in range(N2 - 2, 0, -1):  # left (i=0)
         X[0, j], Y[0, j] = boundary_pts[k]
