@@ -58,7 +58,7 @@ def lyapunov_loss_function(x_train_2d, practice_nn, dynamics: nn.Module):
 
     # 4. Flatness penalty
     x_norm = torch.linalg.vector_norm(x_train_2d, dim=1, keepdim=True)
-    flatness_penalty = torch.relu(x_norm - 0.1 * V_x).mean()
+    flatness_penalty = torch.relu(x_norm - 1 * V_x).mean()
 
     return origin_penalty + positive_penalty + lie_penalty + flatness_penalty
 
