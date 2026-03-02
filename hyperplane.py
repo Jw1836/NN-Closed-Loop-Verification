@@ -358,7 +358,7 @@ def amsden_hirt_grid(polygon_vertices, N1, N2, max_iter=250, tol=1e-6):
     """
     polygon_vertices.append(polygon_vertices[0])  # close the polygon
 
-    omega = 4 / (2 + np.sqrt(4 - (np.cos(np.pi / N1) + np.cos(np.pi / N2)) ** 2))
+    omega = 4 / (2 + np.sqrt(4 - (np.cos(np.pi / N1) + np.cos(np.pi / N2) ** 2)))
     total_pts = 2 * N1 + 2 * N2 - 4
 
     # Compute per-edge arc lengths
@@ -405,7 +405,7 @@ def amsden_hirt_grid(polygon_vertices, N1, N2, max_iter=250, tol=1e-6):
         X[N1 - 1, j], Y[N1 - 1, j] = boundary_pts[k]
         k += 1
     for i in range(N1 - 1, -1, -1):  # top (j=N2-1)
-        X[i, N2 - 1], Y[i, N2 - 1] = boundary_pts[k]
+        X[i, N2 - 1], Y[i, N1 - 1] = boundary_pts[k]
         k += 1
     for j in range(N2 - 2, 0, -1):  # left (i=0)
         X[0, j], Y[0, j] = boundary_pts[k]
@@ -517,13 +517,14 @@ class Polygon:
         -------
         counterexamples : list of (float, float) tuples
         """
+        #print("start gradient function")
         E_2 = np.array([[0.0], [1.0]])
         centroid_pt = np.array([[self.centroid[0]], [self.centroid[1]]])
 
         U = analytic_gradient(model, input_dim, hidden_dim, centroid_pt)
         theta, R = self.rotate(U)
         rotated_U = R @ U
-
+        #print("got rotated gradient")
         # Sanity check: rotated gradient should be close to E_1
         if np.dot(rotated_U.T, E_2) > 1e-3 and rotated_U[0][0] < 0:
             print("Warning: rotated gradient is not close to E_1")
@@ -543,18 +544,19 @@ class Polygon:
             return np.sin(theta) * f1(x) + np.cos(theta) * f2(x)
 
         # Count the number of distinct sign regions inside this polygon
+        #print("origin check")
         # TODO: This is specific to Duffing dynamics; needs to be checked differently for generic dynamics
         origin_inside = is_point_in_polygon(0, 0, self.vertex_coords)
         num_regions = 4 if origin_inside else 1
-
+        #print("get how many regions")
         f1_flag = f2_flag = False
         n = len(self.vertex_coords)
         for j in range(n):
             v1 = self.vertex_coords[j]
             v2 = self.vertex_coords[(j + 1) % n]
-            if not f1_flag and zero_level_set_crosses_edge(v1, v2, rf1):
+            if zero_level_set_crosses_edge(v1, v2, rf1):
                 f1_flag = True
-            if not f2_flag and zero_level_set_crosses_edge(v1, v2, rf2):
+            if zero_level_set_crosses_edge(v1, v2, rf2):
                 f2_flag = True
             if f1_flag and f2_flag:
                 break
@@ -566,12 +568,11 @@ class Polygon:
                 num_regions = 2
 
         # Search via Amsden-Hirt grid for one representative per sign region
+        #print("amsden-hirt stuff")
         N1 = N2 = 15
         found_count = 0
         counter = 0
-        sign_list = []
-        representative_pts = []
-
+        #print("LOOKING FOR REGIONS...")
         while found_count < num_regions and counter < max_refinements:
             # Pass a copy so amsden_hirt_grid's append doesn't corrupt our list
             X_grid, Y_grid = amsden_hirt_grid(
@@ -579,14 +580,24 @@ class Polygon:
                 N1 * (counter + 1),
                 N2 * (counter + 1),
             )
+            representative_pts = []
+            sign_list = []
             for j in range(1, X_grid.shape[0] - 1):
                 for k in range(1, X_grid.shape[1] - 1):
                     x1_pt = X_grid[j, k]
                     x2_pt = Y_grid[j, k]
+
+                    if x1_pt == 0 or x2_pt == 0:
+                        break
+
                     f1_val = rf1(np.array([[x1_pt], [x2_pt]]))
                     f2_val = rf2(np.array([[x1_pt], [x2_pt]]))
                     sign_pair = (np.sign(f1_val), np.sign(f2_val))
-                    if sign_pair not in sign_list:
+                    if len(sign_list) == 0:
+                        sign_list.append(sign_pair)
+                        representative_pts.append((x1_pt, x2_pt))
+                        found_count += 1
+                    elif sign_pair not in sign_list:
                         sign_list.append(sign_pair)
                         representative_pts.append((x1_pt, x2_pt))
                         found_count += 1
@@ -686,6 +697,8 @@ def full_method(
     counterexamples = []
     for node_list in polygon_node_lists:
         poly = Polygon(node_list, vertex_dict)
+        #
+        # print("in polygon list")
         cex = poly.check_gradient(
             net,
             input_dim,
