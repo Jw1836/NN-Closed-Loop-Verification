@@ -22,6 +22,12 @@ class LyapunovProblem:
     def state_dim(self) -> int:
         return self.region.shape[0]
 
+    def to(self, device: str | torch.device) -> None:
+        """Move nn_lyapunov, dynamics, and region to the same given device."""
+        self.nn_lyapunov.to(device)
+        self.dynamics.to(device)
+        self.region.to(device)
+
     def __repr__(self) -> str:
         region_str = ", ".join(
             f"x{i + 1} ∈ [{self.region[i, 0].item():.3g}, {self.region[i, 1].item():.3g}]"
@@ -90,3 +96,33 @@ def train_model_lyapunov_general(
         if (epoch + 1) % 100 == 0:
             print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}")
     return model
+
+
+def train_lyapunov_2d(
+    problem: LyapunovProblem,
+    grid_pts: int = 50,
+    num_epochs: int = 100,
+    learning_rate: float = 1e-3,
+):
+    # Names easier to work with
+    x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
+    x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
+    model = problem.nn_lyapunov
+    device = next(model.parameters()).device
+
+    # First, create a training set from linearly spaced samples in grid
+    x1_t = torch.linspace(x1_min, x1_max, grid_pts)
+    x2_t = torch.linspace(x2_min, x2_max, grid_pts)
+    x1g, x2g = torch.meshgrid(x1_t, x2_t, indexing="ij")
+    x_train = torch.stack([x1g.flatten(), x2g.flatten()], dim=1).to(device)
+
+    # Create an optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    for epoch in range(num_epochs):
+        model.train()
+        optimizer.zero_grad()
+        loss = lyapunov_loss_function(x_train, model, problem.dynamics)
+        loss.backward()
+        optimizer.step()
+        if (epoch + 1) % 100 == 0:
+            print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}")

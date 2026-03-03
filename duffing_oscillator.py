@@ -14,9 +14,6 @@ from torch import nn, Tensor
 
 from lyapunov import LyapunovProblem
 
-# REGION OF INTEREST: [[x1_min, x1_max], [x2_min, x2_max]]
-REGION: Tensor = torch.tensor([[-3.0, 3.0], [-3.0, 3.0]])
-
 # Default Duffing parameters
 DELTA: float = 1.0
 ALPHA: float = 1.0
@@ -55,8 +52,18 @@ class DuffingLyapunov(nn.Module):
 
 
 class DuffingProblem(LyapunovProblem):
+    """Define a Duffing Oscillator Problem.
+
+    Requires region of interest:
+        region (torch.Tensor) form [[x1_min, x1_max], [x2_min, x2_max]]
+    Optional
+        hidden_size (int) of the single layer
+         delta, alpha, beta Duffing params, each defaults to 1.0
+    """
+
     def __init__(
         self,
+        region: Tensor,
         hidden_size: int = 5,
         delta: float = DELTA,
         alpha: float = ALPHA,
@@ -65,5 +72,5 @@ class DuffingProblem(LyapunovProblem):
         super().__init__(
             nn_lyapunov=DuffingLyapunov(hidden_size=hidden_size),
             dynamics=DuffingDynamics(delta, alpha, beta),
-            region=REGION,
+            region=region,
         )

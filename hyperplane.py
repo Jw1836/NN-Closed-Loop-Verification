@@ -17,6 +17,7 @@ import networkx as nx
 import igraph as ig
 import torch
 from torch import nn, Tensor
+from lyapunov import LyapunovProblem
 
 
 # ── Geometry helpers ───────────────────────────────────────────────────────────
@@ -350,7 +351,13 @@ def zero_level_set_crosses_edge(v1, v2, f_function) -> bool:
     return len(np.where(np.diff(np.sign(f_on_edge)) != 0)[0]) > 0
 
 
-def amsden_hirt_grid(polygon_vertices: list[float], N1: int, N2: int, max_iter:int =250, tol:float=1e-6)->tuple[np.ndarray, np.ndarray]:
+def amsden_hirt_grid(
+    polygon_vertices: list[float],
+    N1: int,
+    N2: int,
+    max_iter: int = 250,
+    tol: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray]:
     """Generate a boundary-fitted interior grid for a polygon via SOR (Amsden-Hirt).
 
     Maps the polygon boundary onto the perimeter of an (N1 x N2) structured grid,
@@ -426,16 +433,16 @@ def amsden_hirt_grid(polygon_vertices: list[float], N1: int, N2: int, max_iter:i
     X = np.zeros((N1, N2), dtype=float)
     Y = np.zeros((N1, N2), dtype=float)
     k = 0
-    for row in range(N1):                       # bottom (j=0)
+    for row in range(N1):  # bottom (j=0)
         X[row, 0], Y[row, 0] = boundary_pts[k]
         k += 1
-    for col in range(1, N2 - 1):              # right (i=N1-1)
+    for col in range(1, N2 - 1):  # right (i=N1-1)
         X[N1 - 1, col], Y[N1 - 1, col] = boundary_pts[k]
         k += 1
-    for row in range(N1 - 1, -1, -1):           # top (j=N2-1)
+    for row in range(N1 - 1, -1, -1):  # top (j=N2-1)
         X[row, N2 - 1], Y[row, N2 - 1] = boundary_pts[k]
         k += 1
-    for col in range(N2 - 2, 0, -1):          # left (i=0)
+    for col in range(N2 - 2, 0, -1):  # left (i=0)
         X[0, col], Y[0, col] = boundary_pts[k]
         k += 1
 
@@ -458,8 +465,12 @@ def amsden_hirt_grid(polygon_vertices: list[float], N1: int, N2: int, max_iter:i
         max_diff = 0.0
         for row in range(1, N1 - 1):
             for col in range(1, N2 - 1):
-                x_gs = np.mean([X[row + 1, col], X[row - 1, col], X[row, col + 1], X[row, col - 1]])
-                y_gs = np.mean([Y[row + 1, col], Y[row - 1, col], Y[row, col + 1], Y[row, col - 1]])
+                x_gs = np.mean(
+                    [X[row + 1, col], X[row - 1, col], X[row, col + 1], X[row, col - 1]]
+                )
+                y_gs = np.mean(
+                    [Y[row + 1, col], Y[row - 1, col], Y[row, col + 1], Y[row, col - 1]]
+                )
                 x_new = omega * x_gs + (1 - omega) * X[row, col]
                 y_new = omega * y_gs + (1 - omega) * Y[row, col]
                 diff = max(abs(x_new - X[row, col]), abs(y_new - Y[row, col]))
@@ -544,14 +555,14 @@ class Polygon:
         -------
         counterexamples : list of (float, float) tuples
         """
-        #print("start gradient function")
+        # print("start gradient function")
         E_2 = np.array([[0.0], [1.0]])
         centroid_pt = np.array([[self.centroid[0]], [self.centroid[1]]])
 
         U = analytic_gradient(model, input_dim, hidden_dim, centroid_pt)
         theta, R = self.rotate(U)
         rotated_U = R @ U
-        #print("got rotated gradient")
+        # print("got rotated gradient")
         # Sanity check: rotated gradient should be close to E_1
         if np.dot(rotated_U.T, E_2) > 1e-3 and rotated_U[0][0] < 0:
             print("Warning: rotated gradient is not close to E_1")
@@ -571,11 +582,11 @@ class Polygon:
             return np.sin(theta) * f1(x) + np.cos(theta) * f2(x)
 
         # Count the number of distinct sign regions inside this polygon
-        #print("origin check")
+        # print("origin check")
         # TODO: This is specific to Duffing dynamics; needs to be checked differently for generic dynamics
         origin_inside = is_point_in_polygon(0, 0, self.vertex_coords)
         num_regions = 4 if origin_inside else 1
-        #print("get how many regions")
+        # print("get how many regions")
         f1_flag = f2_flag = False
         n = len(self.vertex_coords)
         for j in range(n):
@@ -595,11 +606,11 @@ class Polygon:
                 num_regions = 2
 
         # Search via Amsden-Hirt grid for one representative per sign region
-        #print("amsden-hirt stuff")
+        # print("amsden-hirt stuff")
         N1 = N2 = 15
         found_count = 0
         counter = 0
-        #print("LOOKING FOR REGIONS...")
+        # print("LOOKING FOR REGIONS...")
         while found_count < num_regions and counter < max_refinements:
             # Pass a copy so amsden_hirt_grid's append doesn't corrupt our list
             X_grid, Y_grid = amsden_hirt_grid(
@@ -650,22 +661,17 @@ class Polygon:
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
 
-def full_method(
-    net: nn.Module,
-    dynamics: nn.Module,
-    region: Tensor,
-) -> tuple[list, list, dict]:
+def full_method(problem: LyapunovProblem) -> tuple[list, list, dict]:
     """End-to-end hyperplane verification pipeline.
 
     Parameters
     ----------
-    net : nn.Module
-        Single-hidden-layer ReLU network (network[0]=Linear, network[1]=ReLU,
-        network[2]=Linear).
-    dynamics : nn.Module
-        System dynamics; forward(x) returns dx with shape (N, 2).
-    region : Tensor, shape (2, 2)
-        Domain bounds [[x1_min, x1_max], [x2_min, x2_max]].
+    problem: LyapunovProblem
+        Includes
+            nn_lyapunov: nn.Module, a single-hidden-layer ReLU network
+                (network[0]=Linear, network[1]=ReLU, network[2]=Linear).
+            dynamics : nn.Module, system dynamics
+            region : Tensor, shape (2, 2), domain bounds [[x1_min, x1_max], [x2_min, x2_max]].
 
     Returns
     -------
@@ -673,11 +679,13 @@ def full_method(
     polygons : list of list[str]   (ordered vertex-name lists)
     vertex_dict : dict[str, array-like]
     """
-    x1_min, x1_max = region[0, 0].item(), region[0, 1].item()
-    x2_min, x2_max = region[1, 0].item(), region[1, 1].item()
+    x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
+    x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
 
-    W_matrix = net.network[0].weight.detach().numpy().T  # (input_dim, hidden_dim)
-    B_vector = net.network[0].bias.detach().numpy()
+    W_matrix = (
+        problem.nn_lyapunov.network[0].weight.detach().numpy().T
+    )  # (input_dim, hidden_dim)
+    B_vector = problem.nn_lyapunov.network[0].bias.detach().numpy()
     input_dim, hidden_layer_size = W_matrix.shape
 
     print("Getting intersection points...")
@@ -727,10 +735,10 @@ def full_method(
         #
         # print("in polygon list")
         cex = poly.check_gradient(
-            net,
+            problem.nn_lyapunov,
             input_dim,
             hidden_layer_size,
-            dynamics,
+            problem.dynamics,
         )
         counterexamples.extend(cex)
     print(
