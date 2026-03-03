@@ -626,7 +626,8 @@ class Polygon:
                     x2_pt = Y_grid[j, k]
 
                     if x1_pt == 0 or x2_pt == 0:
-                        break
+                        # On an axis so just continue
+                        continue
 
                     f1_val = rf1(np.array([[x1_pt], [x2_pt]]))
                     f2_val = rf2(np.array([[x1_pt], [x2_pt]]))
