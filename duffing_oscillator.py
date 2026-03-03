@@ -55,6 +55,15 @@ class DuffingLyapunov(nn.Module):
 
 
 class DuffingProblem(LyapunovProblem):
-    dynamics = DuffingDynamics(DELTA, ALPHA, BETA)
-    nn_lyapunov = DuffingLyapunov(hidden_size=50)
-    region = REGION
+    def __init__(
+        self,
+        hidden_size: int = 5,
+        delta: float = DELTA,
+        alpha: float = ALPHA,
+        beta: float = BETA,
+    ):
+        super().__init__(
+            nn_lyapunov=DuffingLyapunov(hidden_size=hidden_size),
+            dynamics=DuffingDynamics(delta, alpha, beta),
+            region=REGION,
+        )
