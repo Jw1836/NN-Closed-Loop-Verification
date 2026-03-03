@@ -350,98 +350,125 @@ def zero_level_set_crosses_edge(v1, v2, f_function) -> bool:
     return len(np.where(np.diff(np.sign(f_on_edge)) != 0)[0]) > 0
 
 
-def amsden_hirt_grid(polygon_vertices, N1, N2, max_iter=250, tol=1e-6):
-    """Generate a boundary-fitted interior grid for a polygon (Amsden-Hirt / SOR).
+def amsden_hirt_grid(polygon_vertices: list[float], N1: int, N2: int, max_iter:int =250, tol:float=1e-6)->tuple[np.ndarray, np.ndarray]:
+    """Generate a boundary-fitted interior grid for a polygon via SOR (Amsden-Hirt).
 
-    Note: mutates polygon_vertices in place (appends the closing vertex).
-    Pass a copy if the caller needs the original list unchanged.
+    Maps the polygon boundary onto the perimeter of an (N1 x N2) structured grid,
+    distributing points proportionally to edge length, then relaxes the interior
+    to a smooth (harmonic) mapping using successive over-relaxation (SOR).
+
+    Parameters
+    ----------
+    polygon_vertices : list of (float, float)
+        Ordered polygon vertices (open — the closing vertex is NOT repeated).
+        This list is not modified.
+    N1, N2 : int
+        Grid dimensions. Total boundary slots = 2*N1 + 2*N2 - 4.
+    max_iter : int
+        Maximum SOR iterations.
+    tol : float
+        Convergence threshold on the maximum point displacement per iteration.
+
+    Returns
+    -------
+    X, Y : ndarray, shape (N1, N2)
+        Physical coordinates of grid nodes.
     """
-    polygon_vertices.append(polygon_vertices[0])  # close the polygon
+    # Close the polygon without mutating the caller's list.
+    verts = list(polygon_vertices) + [polygon_vertices[0]]
+    n_edges = len(verts) - 1
 
+    # Optimal SOR relaxation factor for a Laplace problem on a rectangular grid.
+    # Formula: ω = 4 / (2 + √(4 - (cos(π/N1) + cos(π/N2))²))
     omega = 4 / (2 + np.sqrt(4 - (np.cos(np.pi / N1) + np.cos(np.pi / N2)) ** 2))
+
+    # Number of boundary slots on the structured grid perimeter.
     total_pts = 2 * N1 + 2 * N2 - 4
 
-    # Compute per-edge arc lengths
+    # ── Boundary point distribution ────────────────────────────────────────────
+    # Allocate boundary slots proportionally to each polygon edge's arc length.
     lengths = [
-        np.linalg.norm(
-            np.array(polygon_vertices[i + 1]) - np.array(polygon_vertices[i])
-        )
-        for i in range(len(polygon_vertices) - 1)
+        np.linalg.norm(np.array(verts[i + 1]) - np.array(verts[i]))
+        for i in range(n_edges)
     ]
     perimeter = sum(lengths)
 
-    # Distribute boundary points proportionally to edge length
+    # Assign integer slot counts to each edge via floor.  Do NOT clamp to 1 —
+    # short edges legitimately get 0 slots, and clamping inflates the total
+    # above total_pts before the remainder correction, causing a mismatch.
+    # The remainder (always in [-n_edges+1, n_edges-1]) goes to the last edge.
+    n_per_edge = [int((edge_len / perimeter) * total_pts) for edge_len in lengths]
+    remainder = total_pts - sum(n_per_edge)
+    n_per_edge[-1] += remainder  # guaranteed non-negative after pure floor
+
     boundary_pts = []
-    pts_left = total_pts
-    for i in range(len(lengths) - 1):
-        n_edge = int((lengths[i] / perimeter) * total_pts)
-        if n_edge <= 0:
+    for i in range(n_edges):
+        n = n_per_edge[i]
+        if n <= 0:
             continue
-        p0 = np.array(polygon_vertices[i])
-        p1 = np.array(polygon_vertices[i + 1])
-        xs = np.linspace(p0[0], p1[0], n_edge, endpoint=False)
-        ys = np.linspace(p0[1], p1[1], n_edge, endpoint=False)
-        for x_new, y_new in zip(xs, ys):
-            boundary_pts.append((float(x_new), float(y_new)))
-        pts_left -= n_edge
+        p0 = np.array(verts[i])
+        p1 = np.array(verts[i + 1])
+        xs = np.linspace(p0[0], p1[0], n, endpoint=False)
+        ys = np.linspace(p0[1], p1[1], n, endpoint=False)
+        boundary_pts.extend(zip(xs.tolist(), ys.tolist()))
 
-    # Remaining points go on the last edge
-    if pts_left > 0:
-        p0 = np.array(polygon_vertices[-2])
-        p1 = np.array(polygon_vertices[-1])
-        xs = np.linspace(p0[0], p1[0], pts_left, endpoint=False)
-        ys = np.linspace(p0[1], p1[1], pts_left, endpoint=False)
-        for x_new, y_new in zip(xs, ys):
-            boundary_pts.append((float(x_new), float(y_new)))
+    if len(boundary_pts) != total_pts:
+        raise ValueError(
+            f"Boundary point count mismatch: expected {total_pts}, got {len(boundary_pts)}"
+        )
 
-    # Assign boundary points to the structured grid boundary
+    # ── Assign boundary points to the structured grid perimeter ───────────────
+    # Walk the perimeter counter-clockwise:
+    #   bottom row  (j=0):      i = 0 … N1-1          (N1 pts)
+    #   right column (i=N1-1):  j = 1 … N2-2          (N2-2 pts)
+    #   top row     (j=N2-1):   i = N1-1 … 0          (N1 pts)
+    #   left column  (i=0):     j = N2-2 … 1          (N2-2 pts)
     X = np.zeros((N1, N2), dtype=float)
     Y = np.zeros((N1, N2), dtype=float)
     k = 0
-    for i in range(N1):  # bottom (j=0)
-        X[i, 0], Y[i, 0] = boundary_pts[k]
+    for row in range(N1):                       # bottom (j=0)
+        X[row, 0], Y[row, 0] = boundary_pts[k]
         k += 1
-    for j in range(1, N1 - 1):  # right (i=N1-1)
-        X[N1 - 1, j], Y[N1 - 1, j] = boundary_pts[k]
+    for col in range(1, N2 - 1):              # right (i=N1-1)
+        X[N1 - 1, col], Y[N1 - 1, col] = boundary_pts[k]
         k += 1
-    for i in range(N1 - 1, -1, -1):  # top (j=N2-1)
-        X[i, N2 - 1], Y[i, N2 - 1] = boundary_pts[k]
+    for row in range(N1 - 1, -1, -1):           # top (j=N2-1)
+        X[row, N2 - 1], Y[row, N2 - 1] = boundary_pts[k]
         k += 1
-    for j in range(N2 - 2, 0, -1):  # left (i=0)
-        X[0, j], Y[0, j] = boundary_pts[k]
+    for col in range(N2 - 2, 0, -1):          # left (i=0)
+        X[0, col], Y[0, col] = boundary_pts[k]
         k += 1
 
-    # Initial interior guess: bilinear interpolation between left/right boundaries
-    for j in range(1, N2 - 1):
-        for i in range(1, N1 - 1):
-            s = i / (N1 - 1)
-            xL, yL = X[0, j], Y[0, j]
-            xR, yR = X[N1 - 1, j], Y[N1 - 1, j]
-            X[i, j] = (1 - s) * xL + s * xR
-            Y[i, j] = (1 - s) * yL + s * yR
+    # ── Initial interior guess ─────────────────────────────────────────────────
+    # Bilinear interpolation between the left (i=0) and right (i=N2-1) columns.
+    # This gives the SOR a reasonable starting point.
+    for col in range(1, N2 - 1):
+        for row in range(1, N1 - 1):
+            s = row / (N1 - 1)
+            X[row, col] = (1 - s) * X[0, col] + s * X[N1 - 1, col]
+            Y[row, col] = (1 - s) * Y[0, col] + s * Y[N1 - 1, col]
 
-    # SOR relaxation
-    prev_X = X.copy()
-    prev_Y = Y.copy()
+    # ── SOR relaxation (Gauss-Seidel sweep with over-relaxation) ──────────────
+    # Each interior node is updated to the average of its four cardinal
+    # neighbours (discretised Laplace equation ∇²X = 0, ∇²Y = 0), scaled
+    # by the over-relaxation factor ω.  Because we write back to X/Y in
+    # place, already-updated neighbors feed into later updates in the same
+    # sweep — this is Gauss-Seidel order, which is what SOR requires.
     for _ in range(max_iter):
         max_diff = 0.0
-        for i in range(1, N1 - 1):
-            for j in range(1, N2 - 1):
-                x_new = 0.25 * (
-                    prev_X[i + 1, j] + X[i - 1, j] + prev_X[i, j + 1] + X[i, j - 1]
-                )
-                y_new = 0.25 * (
-                    prev_Y[i + 1, j] + Y[i - 1, j] + prev_Y[i, j + 1] + Y[i, j - 1]
-                )
-                X[i, j] = omega * x_new + (1 - omega) * prev_X[i, j]
-                Y[i, j] = omega * y_new + (1 - omega) * prev_Y[i, j]
-                diff = max(abs(prev_X[i, j] - X[i, j]), abs(prev_Y[i, j] - Y[i, j]))
+        for row in range(1, N1 - 1):
+            for col in range(1, N2 - 1):
+                x_gs = np.mean([X[row + 1, col], X[row - 1, col], X[row, col + 1], X[row, col - 1]])
+                y_gs = np.mean([Y[row + 1, col], Y[row - 1, col], Y[row, col + 1], Y[row, col - 1]])
+                x_new = omega * x_gs + (1 - omega) * X[row, col]
+                y_new = omega * y_gs + (1 - omega) * Y[row, col]
+                diff = max(abs(x_new - X[row, col]), abs(y_new - Y[row, col]))
                 if diff > max_diff:
                     max_diff = diff
+                X[row, col] = x_new
+                Y[row, col] = y_new
         if max_diff < tol:
             break
-        prev_X = X.copy()
-        prev_Y = Y.copy()
 
     return X, Y
 
@@ -517,13 +544,14 @@ class Polygon:
         -------
         counterexamples : list of (float, float) tuples
         """
+        #print("start gradient function")
         E_2 = np.array([[0.0], [1.0]])
         centroid_pt = np.array([[self.centroid[0]], [self.centroid[1]]])
 
         U = analytic_gradient(model, input_dim, hidden_dim, centroid_pt)
         theta, R = self.rotate(U)
         rotated_U = R @ U
-
+        #print("got rotated gradient")
         # Sanity check: rotated gradient should be close to E_1
         if np.dot(rotated_U.T, E_2) > 1e-3 and rotated_U[0][0] < 0:
             print("Warning: rotated gradient is not close to E_1")
@@ -543,18 +571,19 @@ class Polygon:
             return np.sin(theta) * f1(x) + np.cos(theta) * f2(x)
 
         # Count the number of distinct sign regions inside this polygon
+        #print("origin check")
         # TODO: This is specific to Duffing dynamics; needs to be checked differently for generic dynamics
         origin_inside = is_point_in_polygon(0, 0, self.vertex_coords)
         num_regions = 4 if origin_inside else 1
-
+        #print("get how many regions")
         f1_flag = f2_flag = False
         n = len(self.vertex_coords)
         for j in range(n):
             v1 = self.vertex_coords[j]
             v2 = self.vertex_coords[(j + 1) % n]
-            if not f1_flag and zero_level_set_crosses_edge(v1, v2, rf1):
+            if zero_level_set_crosses_edge(v1, v2, rf1):
                 f1_flag = True
-            if not f2_flag and zero_level_set_crosses_edge(v1, v2, rf2):
+            if zero_level_set_crosses_edge(v1, v2, rf2):
                 f2_flag = True
             if f1_flag and f2_flag:
                 break
@@ -566,12 +595,11 @@ class Polygon:
                 num_regions = 2
 
         # Search via Amsden-Hirt grid for one representative per sign region
+        #print("amsden-hirt stuff")
         N1 = N2 = 15
         found_count = 0
         counter = 0
-        sign_list = []
-        representative_pts = []
-
+        #print("LOOKING FOR REGIONS...")
         while found_count < num_regions and counter < max_refinements:
             # Pass a copy so amsden_hirt_grid's append doesn't corrupt our list
             X_grid, Y_grid = amsden_hirt_grid(
@@ -579,14 +607,24 @@ class Polygon:
                 N1 * (counter + 1),
                 N2 * (counter + 1),
             )
+            representative_pts = []
+            sign_list = []
             for j in range(1, X_grid.shape[0] - 1):
                 for k in range(1, X_grid.shape[1] - 1):
                     x1_pt = X_grid[j, k]
                     x2_pt = Y_grid[j, k]
+
+                    if x1_pt == 0 or x2_pt == 0:
+                        break
+
                     f1_val = rf1(np.array([[x1_pt], [x2_pt]]))
                     f2_val = rf2(np.array([[x1_pt], [x2_pt]]))
                     sign_pair = (np.sign(f1_val), np.sign(f2_val))
-                    if sign_pair not in sign_list:
+                    if len(sign_list) == 0:
+                        sign_list.append(sign_pair)
+                        representative_pts.append((x1_pt, x2_pt))
+                        found_count += 1
+                    elif sign_pair not in sign_list:
                         sign_list.append(sign_pair)
                         representative_pts.append((x1_pt, x2_pt))
                         found_count += 1
@@ -686,6 +724,8 @@ def full_method(
     counterexamples = []
     for node_list in polygon_node_lists:
         poly = Polygon(node_list, vertex_dict)
+        #
+        # print("in polygon list")
         cex = poly.check_gradient(
             net,
             input_dim,
