@@ -71,7 +71,7 @@ def verify_lyapunov_nn(
     verification_result = {}
 
     # V(0) = 0
-    zero_input = torch.zeros(problem.state_dim)
+    zero_input = torch.zeros(problem.state_dim, device=device)
     zero_output = problem.nn_lyapunov(zero_input)
     if isclose(zero_output.item(), 0.0):
         verification_result["origin"] = (True, f"Zero input ==> {zero_output}.")
