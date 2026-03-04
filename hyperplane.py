@@ -16,6 +16,7 @@ import numpy as np
 import networkx as nx
 import igraph as ig
 import torch
+from typing import cast
 from torch import nn, Tensor
 from lyapunov import LyapunovProblem
 
@@ -246,7 +247,36 @@ def _step(x):
     return 1 if x >= 0 else 0
 
 
-def analytic_gradient(model, input_num, hidden_num, x_state):
+def extract_weights(model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract weight arrays from a [Linear, ReLU, Linear] nn.Sequential.
+
+    Returns
+    -------
+    W_matrix : ndarray, shape (input_dim, hidden_dim)
+    B_vector : ndarray, shape (hidden_dim,)
+    W_out_vec : ndarray, shape (hidden_dim,)
+    """
+    try:
+        network = cast(nn.Sequential, model.network)
+        layer0 = cast(nn.Linear, network[0])
+        layer2 = cast(nn.Linear, network[2])
+    except (AttributeError, IndexError) as e:
+        raise TypeError(
+            "model.network must be an nn.Sequential with indexable layers "
+            "[Linear, ReLU, Linear]"
+        ) from e
+    if not isinstance(layer0, nn.Linear) or not isinstance(layer2, nn.Linear):
+        raise TypeError(
+            "model.network[0] and model.network[2] must both be nn.Linear; "
+            f"got {type(layer0).__name__} and {type(layer2).__name__}"
+        )
+    W_matrix = layer0.weight.detach().numpy().T  # (input_dim, hidden_dim)
+    B_vector = layer0.bias.detach().numpy()      # (hidden_dim,)
+    W_out_vec = layer2.weight.detach().numpy().flatten()  # (hidden_dim,)
+    return W_matrix, B_vector, W_out_vec
+
+
+def analytic_gradient(W_matrix, B_vector, W_out_vec, x_state):
     """Compute the exact gradient of the ReLU network at x_state.
 
     Exploits the fact that activation patterns are constant within each
@@ -254,15 +284,14 @@ def analytic_gradient(model, input_num, hidden_num, x_state):
 
     Parameters
     ----------
-    model : nn.Module with a .network Sequential containing [Linear, ReLU, Linear]
-    input_num : int
-    hidden_num : int
-    x_state : array-like, shape (input_num, 1)
+    W_matrix : ndarray, shape (input_dim, hidden_dim)
+    B_vector : ndarray, shape (hidden_dim,)
+    W_out_vec : ndarray, shape (hidden_dim,)
+    x_state : array-like, shape (input_dim, 1)
     """
-    W_matrix = model.network[0].weight.detach().numpy().T  # (input_dim, hidden_dim)
-    B_vector = model.network[0].bias.detach().numpy()  # (hidden_dim,)
-    W_out_vec = model.network[2].weight.detach().numpy().flatten()  # (hidden_dim,)
     W_out_mat = np.diag(W_out_vec)
+    input_num = W_matrix.shape[0]
+    hidden_num = W_matrix.shape[1]
 
     # Flatten to 1-D so dot products always return scalars, regardless of
     # whether x_state was passed as (n,) or (n, 1).
@@ -291,11 +320,11 @@ def _dynamics_numpy(dynamics: nn.Module, x: np.ndarray):
 
 
 def verify_point(
-    model, input_dim, hidden_dim, x1_val, x2_val, dynamics: nn.Module
+    W_matrix, B_vector, W_out_vec, x1_val, x2_val, dynamics: nn.Module
 ) -> bool:
     """Return True if the Lie derivative V_dot < 0 at (x1_val, x2_val)."""
     x = np.array([[x1_val], [x2_val]])
-    grad = analytic_gradient(model, input_dim, hidden_dim, x)
+    grad = analytic_gradient(W_matrix, B_vector, W_out_vec, x)
     f1, f2 = _dynamics_numpy(dynamics, x)
     return float(grad[0] * f1 + grad[1] * f2) < 0
 
@@ -528,9 +557,9 @@ class Polygon:
 
     def check_gradient(
         self,
-        model,
-        input_dim,
-        hidden_dim,
+        W_matrix: np.ndarray,
+        B_vector: np.ndarray,
+        W_out_vec: np.ndarray,
         dynamics: nn.Module,
         max_refinements: int = 10,
     ):
@@ -545,8 +574,9 @@ class Polygon:
 
         Parameters
         ----------
-        model : nn.Module
-        input_dim, hidden_dim : int
+        W_matrix : ndarray, shape (input_dim, hidden_dim)
+        B_vector : ndarray, shape (hidden_dim,)
+        W_out_vec : ndarray, shape (hidden_dim,)
         dynamics : nn.Module
         max_refinements : int
             Maximum grid refinement iterations when searching for sign regions.
@@ -559,7 +589,7 @@ class Polygon:
         E_2 = np.array([[0.0], [1.0]])
         centroid_pt = np.array([[self.centroid[0]], [self.centroid[1]]])
 
-        U = analytic_gradient(model, input_dim, hidden_dim, centroid_pt)
+        U = analytic_gradient(W_matrix, B_vector, W_out_vec, centroid_pt)
         theta, R = self.rotate(U)
         rotated_U = R @ U
         # print("got rotated gradient")
@@ -662,7 +692,7 @@ class Polygon:
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
 
-def full_method(problem: LyapunovProblem) -> tuple[list, list, dict]:
+def full_method(problem: LyapunovProblem) -> tuple[list[tuple[float, float]], list[str], dict[str, np.ndarray]]:
     """End-to-end hyperplane verification pipeline.
 
     Parameters
@@ -683,11 +713,7 @@ def full_method(problem: LyapunovProblem) -> tuple[list, list, dict]:
     x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
     x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
 
-    W_matrix = (
-        problem.nn_lyapunov.network[0].weight.detach().numpy().T
-    )  # (input_dim, hidden_dim)
-    B_vector = problem.nn_lyapunov.network[0].bias.detach().numpy()
-    input_dim, hidden_layer_size = W_matrix.shape
+    W_matrix, B_vector, W_out_vec = extract_weights(problem.nn_lyapunov)
 
     print("Getting intersection points...")
     t0 = time.perf_counter()
@@ -736,9 +762,9 @@ def full_method(problem: LyapunovProblem) -> tuple[list, list, dict]:
         #
         # print("in polygon list")
         cex = poly.check_gradient(
-            problem.nn_lyapunov,
-            input_dim,
-            hidden_layer_size,
+            W_matrix,
+            B_vector,
+            W_out_vec,
             problem.dynamics,
         )
         counterexamples.extend(cex)
