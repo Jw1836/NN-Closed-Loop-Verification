@@ -271,7 +271,7 @@ def extract_weights(model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             f"got {type(layer0).__name__} and {type(layer2).__name__}"
         )
     W_matrix = layer0.weight.detach().numpy().T  # (input_dim, hidden_dim)
-    B_vector = layer0.bias.detach().numpy()      # (hidden_dim,)
+    B_vector = layer0.bias.detach().numpy()  # (hidden_dim,)
     W_out_vec = layer2.weight.detach().numpy().flatten()  # (hidden_dim,)
     return W_matrix, B_vector, W_out_vec
 
@@ -692,7 +692,9 @@ class Polygon:
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
 
-def full_method(problem: LyapunovProblem) -> tuple[list[tuple[float, float]], list[str], dict[str, np.ndarray]]:
+def full_method(
+    problem: LyapunovProblem,
+) -> tuple[list[tuple[float, float]], list[str], dict[str, np.ndarray]]:
     """End-to-end hyperplane verification pipeline.
 
     Parameters
