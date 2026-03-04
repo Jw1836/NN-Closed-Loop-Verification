@@ -16,6 +16,7 @@ import numpy as np
 import networkx as nx
 import igraph as ig
 import torch
+from multiprocessing import Pool
 from typing import cast
 from torch import nn, Tensor
 from lyapunov import LyapunovProblem
@@ -650,30 +651,34 @@ class Polygon:
             )
             representative_pts = []
             sign_list = []
-            for j in range(1, X_grid.shape[0] - 1):
-                for k in range(1, X_grid.shape[1] - 1):
-                    x1_pt = X_grid[j, k]
-                    x2_pt = Y_grid[j, k]
 
-                    if x1_pt == 0 or x2_pt == 0:
-                        # On an axis so just continue
-                        continue
+            # Extract all interior points as flat arrays and mask out axis points
+            xs = X_grid[1:-1, 1:-1].ravel()
+            ys = Y_grid[1:-1, 1:-1].ravel()
+            mask = (xs != 0) & (ys != 0)
+            xs, ys = xs[mask], ys[mask]
 
-                    f1_val = rf1(np.array([[x1_pt], [x2_pt]]))
-                    f2_val = rf2(np.array([[x1_pt], [x2_pt]]))
-                    sign_pair = (np.sign(f1_val), np.sign(f2_val))
-                    if len(sign_list) == 0:
+            if len(xs) > 0:
+                # Batched dynamics evaluation: one forward pass for all points
+                pts = torch.tensor(np.stack([xs, ys], axis=1), dtype=torch.float32)
+                with torch.no_grad():
+                    out = dynamics(pts)
+                f1_vals = out[:, 0].numpy()
+                f2_vals = out[:, 1].numpy()
+
+                # Apply rotation to all points
+                rf1_vals = np.cos(theta) * f1_vals - np.sin(theta) * f2_vals
+                rf2_vals = np.sin(theta) * f1_vals + np.cos(theta) * f2_vals
+
+                # Find one representative per distinct sign pair
+                for i in range(len(xs)):
+                    sign_pair = (np.sign(rf1_vals[i]), np.sign(rf2_vals[i]))
+                    if sign_pair not in sign_list:
                         sign_list.append(sign_pair)
-                        representative_pts.append((x1_pt, x2_pt))
+                        representative_pts.append((xs[i], ys[i]))
                         found_count += 1
-                    elif sign_pair not in sign_list:
-                        sign_list.append(sign_pair)
-                        representative_pts.append((x1_pt, x2_pt))
-                        found_count += 1
-                    if found_count == num_regions:
-                        break
-                if found_count == num_regions:
-                    break
+                        if found_count == num_regions:
+                            break
             counter += 1
 
         if found_count < num_regions:
@@ -690,6 +695,12 @@ class Polygon:
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
+
+
+def _check_poly_worker(args):
+    node_list, vertex_dict, W_matrix, B_vector, W_out_vec, dynamics = args
+    poly = Polygon(node_list, vertex_dict)
+    return poly.check_gradient(W_matrix, B_vector, W_out_vec, dynamics)
 
 
 def full_method(
@@ -758,18 +769,14 @@ def full_method(
 
     print("Running verification...")
     t0 = time.perf_counter()
-    counterexamples = []
-    for node_list in polygon_node_lists:
-        poly = Polygon(node_list, vertex_dict)
-        #
-        # print("in polygon list")
-        cex = poly.check_gradient(
-            W_matrix,
-            B_vector,
-            W_out_vec,
-            problem.dynamics,
-        )
-        counterexamples.extend(cex)
+    dynamics_cpu = problem.dynamics.cpu()
+    work_items = [
+        (node_list, vertex_dict, W_matrix, B_vector, W_out_vec, dynamics_cpu)
+        for node_list in polygon_node_lists
+    ]
+    with Pool() as pool:
+        results = pool.map(_check_poly_worker, work_items)
+    counterexamples = [cex for batch in results for cex in batch]
     print(
         f"  done ({time.perf_counter() - t0:.3f}s)  "
         f"— {len(counterexamples)} counterexamples"
