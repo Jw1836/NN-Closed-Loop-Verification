@@ -52,6 +52,7 @@ class DuffingLyapunov(nn.Module):
 
 
 class DuffingProblem(LyapunovProblem):
+<<<<<<< Updated upstream
     """Define a Duffing Oscillator Problem.
 
     Requires region of interest:
@@ -74,3 +75,8 @@ class DuffingProblem(LyapunovProblem):
             dynamics=DuffingDynamics(delta, alpha, beta),
             region=region,
         )
+=======
+    dynamics = DuffingDynamics(DELTA, ALPHA, BETA)
+    nn_lyapunov = DuffingLyapunov(hidden_size=10)
+    region = REGION
+>>>>>>> Stashed changes
