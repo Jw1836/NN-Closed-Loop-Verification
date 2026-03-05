@@ -562,15 +562,16 @@ class Polygon:
         B_vector: np.ndarray,
         W_out_vec: np.ndarray,
         dynamics: nn.Module,
-        grid_size: int = 30,
+        max_refinements: int = 10,
     ):
         """Find counterexample points inside this polygon.
 
         Computes the analytic gradient at the centroid, rotates the coordinate
-        frame so the gradient aligns with E_1, then uses an Amsden-Hirt grid
-        to exhaustively find all distinct sign regions of the rotated dynamics.
-        Points where the rotated f1 component is positive (V_dot >= 0) are
-        returned as counterexamples.
+        frame so the gradient aligns with E_1, counts how many distinct sign
+        regions of the rotated dynamics exist in the polygon, then uses an
+        Amsden-Hirt grid to find one representative point per region. Points
+        where the rotated f1 component is positive (V_dot >= 0) are returned
+        as counterexamples.
 
         Parameters
         ----------
@@ -578,56 +579,114 @@ class Polygon:
         B_vector : ndarray, shape (hidden_dim,)
         W_out_vec : ndarray, shape (hidden_dim,)
         dynamics : nn.Module
-        grid_size : int
-            Resolution of the Amsden-Hirt interior grid (grid_size x grid_size).
+        max_refinements : int
+            Maximum grid refinement iterations when searching for sign regions.
 
         Returns
         -------
         counterexamples : list of (float, float) tuples
         """
+        # print("start gradient function")
         E_2 = np.array([[0.0], [1.0]])
         centroid_pt = np.array([[self.centroid[0]], [self.centroid[1]]])
 
         U = analytic_gradient(W_matrix, B_vector, W_out_vec, centroid_pt)
         theta, R = self.rotate(U)
         rotated_U = R @ U
+        # print("got rotated gradient")
         # Sanity check: rotated gradient should be close to E_1
         if np.dot(rotated_U.T, E_2) > 1e-3 and rotated_U[0][0] < 0:
             print("Warning: rotated gradient is not close to E_1")
 
-        # Single-pass exhaustive grid scan — no num_regions estimation needed
-        X_grid, Y_grid = amsden_hirt_grid(
-            list(self.vertex_coords), grid_size, grid_size
-        )
+        # Component callables from dynamics module
+        def f1(x):
+            return _dynamics_numpy(dynamics, x)[0]
 
-        xs = X_grid[1:-1, 1:-1].ravel()
-        ys = Y_grid[1:-1, 1:-1].ravel()
+        def f2(x):
+            return _dynamics_numpy(dynamics, x)[1]
 
-        # Exclude only the origin (not entire axes)
-        mask = (xs**2 + ys**2) > 1e-12
-        xs, ys = xs[mask], ys[mask]
+        # Rotated dynamics
+        def rf1(x):
+            return np.cos(theta) * f1(x) - np.sin(theta) * f2(x)
 
-        representative_pts = []
-        sign_list = []
+        def rf2(x):
+            return np.sin(theta) * f1(x) + np.cos(theta) * f2(x)
 
-        if len(xs) > 0:
-            # Batched dynamics evaluation: one forward pass for all points
-            pts = torch.tensor(np.stack([xs, ys], axis=1), dtype=torch.float32)
-            with torch.no_grad():
-                out = dynamics(pts)
-            f1_vals = out[:, 0].numpy()
-            f2_vals = out[:, 1].numpy()
+        # Count the number of distinct sign regions inside this polygon
+        # print("origin check")
+        # TODO: This is specific to Duffing dynamics; needs to be checked differently for generic dynamics
+        origin_inside = is_point_in_polygon(0, 0, self.vertex_coords)
+        num_regions = 4 if origin_inside else 1
+        # print("get how many regions")
+        f1_flag = f2_flag = False
+        n = len(self.vertex_coords)
+        for j in range(n):
+            v1 = self.vertex_coords[j]
+            v2 = self.vertex_coords[(j + 1) % n]
+            if zero_level_set_crosses_edge(v1, v2, rf1):
+                f1_flag = True
+            if zero_level_set_crosses_edge(v1, v2, rf2):
+                f2_flag = True
+            if f1_flag and f2_flag:
+                break
 
-            # Apply rotation to all points
-            rf1_vals = np.cos(theta) * f1_vals - np.sin(theta) * f2_vals
-            rf2_vals = np.sin(theta) * f1_vals + np.cos(theta) * f2_vals
+        if not origin_inside:
+            if f1_flag and f2_flag:
+                num_regions = 3
+            elif f1_flag != f2_flag:
+                num_regions = 2
 
-            # Collect ALL distinct sign pairs — no early termination
-            for i in range(len(xs)):
-                sign_pair = (np.sign(rf1_vals[i]), np.sign(rf2_vals[i]))
-                if sign_pair not in sign_list:
-                    sign_list.append(sign_pair)
-                    representative_pts.append((xs[i], ys[i]))
+        # Search via Amsden-Hirt grid for one representative per sign region
+        # print("amsden-hirt stuff")
+        N1 = N2 = 15
+        found_count = 0
+        counter = 0
+        # print("LOOKING FOR REGIONS...")
+        while found_count < num_regions and counter < max_refinements:
+            # Pass a copy so amsden_hirt_grid's append doesn't corrupt our list
+            X_grid, Y_grid = amsden_hirt_grid(
+                list(self.vertex_coords),
+                N1 * (counter + 1),
+                N2 * (counter + 1),
+            )
+            representative_pts = []
+            sign_list = []
+
+            # Extract all interior points as flat arrays and mask out axis points
+            xs = X_grid[1:-1, 1:-1].ravel()
+            ys = Y_grid[1:-1, 1:-1].ravel()
+            mask = (xs != 0) & (ys != 0)
+            xs, ys = xs[mask], ys[mask]
+
+            if len(xs) > 0:
+                # Batched dynamics evaluation: one forward pass for all points
+                pts = torch.tensor(np.stack([xs, ys], axis=1), dtype=torch.float32)
+                with torch.no_grad():
+                    out = dynamics(pts)
+                f1_vals = out[:, 0].numpy()
+                f2_vals = out[:, 1].numpy()
+
+                # Apply rotation to all points
+                rf1_vals = np.cos(theta) * f1_vals - np.sin(theta) * f2_vals
+                rf2_vals = np.sin(theta) * f1_vals + np.cos(theta) * f2_vals
+
+                # Find one representative per distinct sign pair
+                for i in range(len(xs)):
+                    sign_pair = (np.sign(rf1_vals[i]), np.sign(rf2_vals[i]))
+                    if sign_pair not in sign_list:
+                        sign_list.append(sign_pair)
+                        representative_pts.append((xs[i], ys[i]))
+                        found_count += 1
+                        if found_count == num_regions:
+                            break
+            counter += 1
+
+        if found_count < num_regions:
+            print(
+                f"Warning: found {found_count}/{num_regions} sign regions after "
+                f"{counter} refinements at centroid "
+                f"({self.centroid[0]:.4f}, {self.centroid[1]:.4f})"
+            )
 
         # Counterexamples: regions where rotated f1 > 0  (V_dot >= 0)
         return [
@@ -639,14 +698,13 @@ class Polygon:
 
 
 def _check_poly_worker(args):
-    node_list, vertex_dict, W_matrix, B_vector, W_out_vec, dynamics, grid_size = args
+    node_list, vertex_dict, W_matrix, B_vector, W_out_vec, dynamics = args
     poly = Polygon(node_list, vertex_dict)
-    return poly.check_gradient(W_matrix, B_vector, W_out_vec, dynamics, grid_size)
+    return poly.check_gradient(W_matrix, B_vector, W_out_vec, dynamics)
 
 
 def full_method(
     problem: LyapunovProblem,
-    grid_size: int = 30,
 ) -> tuple[list[tuple[float, float]], list[str], dict[str, np.ndarray]]:
     """End-to-end hyperplane verification pipeline.
 
@@ -709,31 +767,11 @@ def full_method(
         f"— {len(polygon_node_lists)} polygons"
     )
 
-    # Polygon coverage diagnostic: check that faces tile the domain
-    domain_area = (x1_max - x1_min) * (x2_max - x2_min)
-    total_poly_area = 0.0
-    for nodes in polygon_node_lists:
-        coords = [vertex_dict[n] for n in nodes]
-        n_v = len(coords)
-        total_poly_area += 0.5 * abs(
-            sum(
-                coords[i][0] * coords[(i + 1) % n_v][1]
-                - coords[(i + 1) % n_v][0] * coords[i][1]
-                for i in range(n_v)
-            )
-        )
-    coverage = total_poly_area / domain_area if domain_area > 0 else 0.0
-    if coverage < 0.95:
-        print(
-            f"  Warning: polygon coverage = {coverage:.1%} of domain area "
-            f"({total_poly_area:.2f} / {domain_area:.2f})"
-        )
-
     print("Running verification...")
     t0 = time.perf_counter()
     dynamics_cpu = problem.dynamics.cpu()
     work_items = [
-        (node_list, vertex_dict, W_matrix, B_vector, W_out_vec, dynamics_cpu, grid_size)
+        (node_list, vertex_dict, W_matrix, B_vector, W_out_vec, dynamics_cpu)
         for node_list in polygon_node_lists
     ]
     with Pool() as pool:

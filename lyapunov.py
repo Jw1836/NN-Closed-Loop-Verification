@@ -42,7 +42,7 @@ class LyapunovProblem:
         )
 
 
-def lyapunov_loss_function(x_train_2d, practice_nn, dynamics: nn.Module):
+def lyapunov_loss_function(x_train_2d, practice_nn, dynamics: nn.Module, alpha):
     """Composite Lyapunov training loss.
 
     Penalises:
@@ -77,7 +77,7 @@ def lyapunov_loss_function(x_train_2d, practice_nn, dynamics: nn.Module):
 
     # 4. Flatness penalty
     x_norm = torch.linalg.vector_norm(x_train_2d, dim=1, keepdim=True)
-    flatness_penalty = torch.relu(x_norm - 1 * V_x).mean()
+    flatness_penalty = torch.relu(x_norm - alpha * V_x).mean()
 
     return origin_penalty + positive_penalty + lie_penalty + flatness_penalty
 
@@ -161,6 +161,7 @@ def train_lyapunov_2d(
     grid_pts: int = 50,
     num_epochs: int = 100,
     learning_rate: float = 1e-3,
+    alpha: float = 1.0
 ):
     # Names easier to work with
     x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
@@ -179,7 +180,7 @@ def train_lyapunov_2d(
     for epoch in range(num_epochs):
         model.train()
         optimizer.zero_grad()
-        loss = lyapunov_loss_function(x_train, model, problem.dynamics)
+        loss = lyapunov_loss_function(x_train, model, problem.dynamics, alpha)
         loss.backward()
         optimizer.step()
         if (epoch + 1) % 100 == 0:
