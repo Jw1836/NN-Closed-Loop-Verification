@@ -20,6 +20,7 @@ from multiprocessing import Pool
 from typing import cast
 from torch import nn, Tensor
 from lyapunov import LyapunovProblem
+from numpy.typing import ArrayLike, NDArray
 
 
 # ── Geometry helpers ───────────────────────────────────────────────────────────
@@ -47,7 +48,14 @@ def find_intersection(plane_1_normal, plane_1_bias, plane_2_normal, plane_2_bias
     return np.linalg.solve(A, b)
 
 
-def find_all_intersection_points(W_matrix, B_vector, x1_min, x1_max, x2_min, x2_max):
+def find_all_intersection_points(
+    W_matrix: NDArray,
+    B_vector: NDArray,
+    x1_min: float,
+    x1_max: float,
+    x2_min: float,
+    x2_max: float,
+):
     """Find all pairwise intersections of ReLU hyperplanes, plus their
     intersections with the four domain edges, clipped to the rectangle.
 
@@ -108,11 +116,32 @@ def find_all_intersection_points(W_matrix, B_vector, x1_min, x1_max, x2_min, x2_
         intersection_points.append(corner)
 
     # Discard any points that fell outside the rectangle
-    return [
+    clipped = [
         p
         for p in intersection_points
         if is_within_rect(p, x1_min, x1_max, x2_min, x2_max)
     ]
+
+    # ── Deduplicate coincident points ──────────────────────────────────────────
+    # The same physical point can appear multiple times from different sources:
+    #   - A hyperplane passing through a rectangle corner produces both a
+    #     hyperplane-edge intersection AND a corner entry.
+    #   - Three hyperplanes meeting at one point produce 3 pairwise entries.
+    # Duplicate vertices with distinct labels (e.g. v3, v7 for the same
+    # location) create zero-length edges in the planar graph and corrupt
+    # the MCB polygon extraction.  Merge any points within `dedup_tol`.
+    dedup_tol = 1e-6
+    unique_points: list = []
+    for p in clipped:
+        p_arr = np.asarray(p, dtype=float)
+        is_dup = False
+        for q in unique_points:
+            if np.linalg.norm(p_arr - q) < dedup_tol:
+                is_dup = True
+                break
+        if not is_dup:
+            unique_points.append(p_arr)
+    return unique_points
 
 
 def _connect_consecutive_on_edge(points_on_edge, edge_name, edge_list):
@@ -248,7 +277,7 @@ def _step(x):
     return 1 if x >= 0 else 0
 
 
-def extract_weights(model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def extract_weights(model) -> tuple[NDArray, NDArray, NDArray]:
     """Extract weight arrays from a [Linear, ReLU, Linear] nn.Sequential.
 
     Returns
@@ -277,7 +306,9 @@ def extract_weights(model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return W_matrix, B_vector, W_out_vec
 
 
-def analytic_gradient(W_matrix, B_vector, W_out_vec, x_state):
+def analytic_gradient(
+    W_matrix: NDArray, B_vector: NDArray, W_out_vec: NDArray, x_state: ArrayLike
+):
     """Compute the exact gradient of the ReLU network at x_state.
 
     Exploits the fact that activation patterns are constant within each
@@ -564,7 +595,10 @@ class Polygon:
             )
         gx, gy = float(grad_flat[0]), float(grad_flat[1])
         theta = -np.arctan2(gy, gx)
-        R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]], dtype=float)
+        R = np.array(
+            [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]],
+            dtype=float,
+        )
         return theta, R
 
     def check_gradient(
@@ -600,6 +634,16 @@ class Polygon:
         centroid_pt = np.array([[self.centroid[0]], [self.centroid[1]]])
 
         U = analytic_gradient(W_matrix, B_vector, W_out_vec, centroid_pt)
+
+        # ── Zero-gradient early exit ──────────────────────────────────────────
+        # If ∇V = 0 then V is constant in this polygon, so V_dot = ∇V · f = 0
+        # everywhere — V is not strictly decreasing.  The rotation framework
+        # below is undefined (no direction to align with E_1), and would
+        # fall through to checking rf1 = f1, which is unrelated to V_dot.
+        # Return the centroid as a counterexample immediately.
+        if np.linalg.norm(U) < 1e-10:
+            return [(float(self.centroid[0]), float(self.centroid[1]))]
+
         theta, R = self.rotate(U)
         rotated_U = R @ U
         # print("got rotated gradient")
@@ -709,8 +753,16 @@ class Polygon:
         if not rf1_crosses:
             return []
 
+        # ── Amsden-Hirt grid fallback ─────────────────────────────────────────
+        # We reach here only when rf1_crosses=True (a sign change was detected
+        # on an edge) but fast probes couldn't locate a nonneg-rf1 interior
+        # point.  Progressively refine the grid until we find one.
+        # Cap the number of refinements to avoid an infinite loop; if
+        # exhausted, return the centroid as a conservative counterexample —
+        # rf1_crosses already confirmed a violation exists in this polygon.
+        _max_ref = max_refinements if max_refinements is not None else 8
         refine = 1
-        while True:
+        while refine <= _max_ref:
             grid_n = 12 * (2 ** (refine - 1))
             print(f"Amsden-Hirt fallback refine={refine}, grid={grid_n}x{grid_n}")
             X_grid, Y_grid = amsden_hirt_grid(
@@ -750,11 +802,19 @@ class Polygon:
                         )
                         break
 
-            if found_point is None:
-                refine += 1
-                continue
+            if found_point is not None:
+                return [found_point]
 
-            return [found_point]
+            refine += 1
+
+        # Grid search exhausted without finding an interior point.
+        # rf1_crosses=True guarantees a violation exists on/near this polygon,
+        # so return the centroid as a conservative counterexample for CEGIS.
+        print(
+            f"Warning: Amsden-Hirt exhausted {_max_ref} refinements; "
+            f"returning centroid as conservative counterexample"
+        )
+        return [(float(self.centroid[0]), float(self.centroid[1]))]
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
