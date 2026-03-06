@@ -365,7 +365,7 @@ def zero_level_set_crosses_edge(v1, v2, f_function) -> bool:
     # Refine along the edge
     x1_diff = x1_max_e - x1_min_e
     x2_diff = x2_max_e - x2_min_e
-    steps = max(int(max(x1_diff, x2_diff) * 10), 100)
+    steps = max(int(max(x1_diff, x2_diff) * 10), 200)
 
     if abs(v2[0] - v1[0]) < 1e-10:  # vertical edge
         x1_on_edge = np.full(steps, v1[0])
@@ -552,8 +552,14 @@ class Polygon:
         R : ndarray, shape (2, 2)
             Rotation matrix.
         """
-        theta = -np.arctan2(gradient_vec[1][0], gradient_vec[0][0])
-        R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+        grad_flat = np.asarray(gradient_vec, dtype=float).reshape(-1)
+        if grad_flat.size < 2:
+            raise ValueError(
+                f"gradient_vec must have at least 2 entries, got shape {np.asarray(gradient_vec).shape}"
+            )
+        gx, gy = float(grad_flat[0]), float(grad_flat[1])
+        theta = -np.arctan2(gy, gx)
+        R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]], dtype=float)
         return theta, R
 
     def check_gradient(
@@ -562,7 +568,7 @@ class Polygon:
         B_vector: np.ndarray,
         W_out_vec: np.ndarray,
         dynamics: nn.Module,
-        max_refinements: int = 10,
+        max_refinements: int | None = None,
     ):
         """Find counterexample points inside this polygon.
 
@@ -579,8 +585,6 @@ class Polygon:
         B_vector : ndarray, shape (hidden_dim,)
         W_out_vec : ndarray, shape (hidden_dim,)
         dynamics : nn.Module
-        max_refinements : int
-            Maximum grid refinement iterations when searching for sign regions.
 
         Returns
         -------
@@ -595,7 +599,10 @@ class Polygon:
         rotated_U = R @ U
         # print("got rotated gradient")
         # Sanity check: rotated gradient should be close to E_1
-        if np.dot(rotated_U.T, E_2) > 1e-3 and rotated_U[0][0] < 0:
+        rotated_flat = np.asarray(rotated_U, dtype=float).reshape(-1)
+        if rotated_flat.size >= 2 and (
+            abs(float(rotated_flat[1])) > 1e-3 or float(rotated_flat[0]) < 0
+        ):
             print("Warning: rotated gradient is not close to E_1")
 
         # Component callables from dynamics module
@@ -612,86 +619,111 @@ class Polygon:
         def rf2(x):
             return np.sin(theta) * f1(x) + np.cos(theta) * f2(x)
 
-        # Count the number of distinct sign regions inside this polygon
-        # print("origin check")
-        # TODO: This is specific to Duffing dynamics; needs to be checked differently for generic dynamics
-        origin_inside = is_point_in_polygon(0, 0, self.vertex_coords)
-        num_regions = 4 if origin_inside else 1
-        # print("get how many regions")
-        f1_flag = f2_flag = False
-        n = len(self.vertex_coords)
-        for j in range(n):
-            v1 = self.vertex_coords[j]
-            v2 = self.vertex_coords[(j + 1) % n]
-            if zero_level_set_crosses_edge(v1, v2, rf1):
-                f1_flag = True
-            if zero_level_set_crosses_edge(v1, v2, rf2):
-                f2_flag = True
-            if f1_flag and f2_flag:
+        sign_eps = 1e-7
+
+        # Region count rule: 2 if rf1 zero-level set crosses the polygon boundary,
+        # otherwise 1.
+        rf1_crosses = False
+        crossing_edge = None
+        for i in range(len(self.vertex_coords)):
+            p0 = self.vertex_coords[i]
+            p1 = self.vertex_coords[(i + 1) % len(self.vertex_coords)]
+            if zero_level_set_crosses_edge(p0, p1, rf1):
+                rf1_crosses = True
+                crossing_edge = (p0, p1)
                 break
+        num_regions = 2 if rf1_crosses else 1
 
-        if not origin_inside:
-            if f1_flag and f2_flag:
-                num_regions = 3
-            elif f1_flag != f2_flag:
-                num_regions = 2
+        # If only one region, classify using centroid sign of rf1.
+        if num_regions == 1:
+            cex_val = float(rf1(centroid_pt))
+            if cex_val >= -sign_eps:
+                return [(float(self.centroid[0]), float(self.centroid[1]))]
+            return []
 
-        # Search via Amsden-Hirt grid for one representative per sign region
-        # print("amsden-hirt stuff")
-        N1 = N2 = 15
-        found_count = 0
-        counter = 0
-        # print("LOOKING FOR REGIONS...")
-        while found_count < num_regions and counter < max_refinements:
-            # Pass a copy so amsden_hirt_grid's append doesn't corrupt our list
+        # If two regions, first try fast edge/vertex probes to avoid refinement.
+        probe_points = [(float(self.centroid[0]), float(self.centroid[1]))]
+        for i in range(len(self.vertex_coords)):
+            p0 = self.vertex_coords[i]
+            p1 = self.vertex_coords[(i + 1) % len(self.vertex_coords)]
+            x0, y0 = float(p0[0]), float(p0[1])
+            x1, y1 = float(p1[0]), float(p1[1])
+            probe_points.append((x0, y0))
+            probe_points.append((0.5 * (x0 + x1), 0.5 * (y0 + y1)))
+
+        if crossing_edge is not None:
+            (x0, y0), (x1, y1) = crossing_edge
+            x0, y0 = float(x0), float(y0)
+            x1, y1 = float(x1), float(y1)
+            v0 = float(rf1(np.array([[x0], [y0]])))
+            v1 = float(rf1(np.array([[x1], [y1]])))
+
+            # If edge endpoints bracket zero, bisection gives a near-zero point quickly.
+            if v0 * v1 < 0.0:
+                lo = np.array([x0, y0], dtype=float)
+                hi = np.array([x1, y1], dtype=float)
+                vlo = v0
+                vhi = v1
+                best_nonneg = None
+
+                for _ in range(40):
+                    mid = 0.5 * (lo + hi)
+                    vmid = float(rf1(np.array([[mid[0]], [mid[1]]])))
+                    if vmid >= -sign_eps:
+                        best_nonneg = (float(mid[0]), float(mid[1]))
+                    if vlo * vmid <= 0.0:
+                        hi = mid
+                        vhi = vmid
+                    else:
+                        lo = mid
+                        vlo = vmid
+
+                if best_nonneg is not None:
+                    return [best_nonneg]
+
+        best_probe = None
+        best_probe_val = -np.inf
+        for px, py in probe_points:
+            val = float(rf1(np.array([[px], [py]])))
+            if val >= -sign_eps and val > best_probe_val:
+                best_probe_val = val
+                best_probe = (px, py)
+        if best_probe is not None:
+            return [best_probe]
+
+        # Fallback: unbounded progressive interior refinement until a
+        # nonnegative-rf1 representative is found.
+        refine = 1
+        while True:
+            grid_n = 12 * (2 ** (refine - 1))
             X_grid, Y_grid = amsden_hirt_grid(
                 list(self.vertex_coords),
-                N1 * (counter + 1),
-                N2 * (counter + 1),
+                grid_n,
+                grid_n,
             )
-            representative_pts = []
-            sign_list = []
+            X_int = X_grid[1:-1, 1:-1]
+            Y_int = Y_grid[1:-1, 1:-1]
+            rows, cols = X_int.shape
+            if rows == 0 or cols == 0:
+                refine += 1
+                continue
 
-            # Extract all interior points as flat arrays and mask out axis points
-            xs = X_grid[1:-1, 1:-1].ravel()
-            ys = Y_grid[1:-1, 1:-1].ravel()
-            mask = (xs != 0) & (ys != 0)
-            xs, ys = xs[mask], ys[mask]
+            xs = X_int.ravel()
+            ys = Y_int.ravel()
+            pts = torch.tensor(np.stack([xs, ys], axis=1), dtype=torch.float32)
+            with torch.no_grad():
+                out = dynamics(pts)
+            f1_vals = out[:, 0].numpy()
+            f2_vals = out[:, 1].numpy()
+            rf1_vals = np.cos(theta) * f1_vals - np.sin(theta) * f2_vals
 
-            if len(xs) > 0:
-                # Batched dynamics evaluation: one forward pass for all points
-                pts = torch.tensor(np.stack([xs, ys], axis=1), dtype=torch.float32)
-                with torch.no_grad():
-                    out = dynamics(pts)
-                f1_vals = out[:, 0].numpy()
-                f2_vals = out[:, 1].numpy()
+            candidates = np.where(rf1_vals >= -sign_eps)[0]
+            if candidates.size == 0:
+                refine += 1
+                continue
 
-                # Apply rotation to all points
-                rf1_vals = np.cos(theta) * f1_vals - np.sin(theta) * f2_vals
-                rf2_vals = np.sin(theta) * f1_vals + np.cos(theta) * f2_vals
-
-                # Find one representative per distinct sign pair
-                for i in range(len(xs)):
-                    sign_pair = (np.sign(rf1_vals[i]), np.sign(rf2_vals[i]))
-                    if sign_pair not in sign_list:
-                        sign_list.append(sign_pair)
-                        representative_pts.append((xs[i], ys[i]))
-                        found_count += 1
-                        if found_count == num_regions:
-                            break
-            counter += 1
-
-        if found_count < num_regions:
-            print(
-                f"Warning: found {found_count}/{num_regions} sign regions after "
-                f"{counter} refinements at centroid "
-                f"({self.centroid[0]:.4f}, {self.centroid[1]:.4f})"
-            )
-
-        # Counterexamples: regions where rotated f1 > 0  (V_dot >= 0)
-        return [
-            representative_pts[j] for j, signs in enumerate(sign_list) if signs[0] > 0
-        ]
+            best_idx = int(candidates[np.argmax(rf1_vals[candidates])])
+            return [(float(xs[best_idx]), float(ys[best_idx]))]
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
