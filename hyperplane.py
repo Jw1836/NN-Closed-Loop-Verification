@@ -589,6 +589,15 @@ class Polygon:
         grad = analytic_gradient(W_matrix, B_vector, W_out_vec, x_col)
         g1, g2 = float(grad[0, 0]), float(grad[1, 0])
 
+        # ── Zero-gradient early exit ──────────────────────────────────────────
+        # If ∇V = 0 then V is constant in this polygon, so V_dot = ∇V · f = 0
+        # everywhere — V is not strictly decreasing.  The rotation framework
+        # below is undefined (no direction to align with E_1), and would
+        # fall through to checking rf1 = f1, which is unrelated to V_dot.
+        # Return the centroid as a counterexample immediately.
+        if np.linalg.norm(grad) < 1e-10:
+            return [(float(self.centroid[0]), float(self.centroid[1]))]
+
         theta = -np.arctan2(g2, g1)
         cos_t = float(np.cos(theta))
         sin_t = float(np.sin(theta))
@@ -737,6 +746,7 @@ def full_method(
         for node_list in polygon_node_lists
     ]
     with Pool() as pool:
+        print(f"Using {pool._processes} parallel workers...")
         results = pool.map(_check_poly_worker, work_items)
     counterexamples = [cex for batch in results for cex in batch]
     print(

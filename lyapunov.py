@@ -42,7 +42,7 @@ class LyapunovProblem:
         )
 
 
-def lyapunov_loss_function(x_train_2d, practice_nn, dynamics: nn.Module, alpha):
+def lyapunov_loss_function(x_train_2d, practice_nn, dynamics: nn.Module, alpha: float = 0.1):
     """Composite Lyapunov training loss.
 
     Penalises:
