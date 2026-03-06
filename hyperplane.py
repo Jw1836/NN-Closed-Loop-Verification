@@ -362,10 +362,10 @@ def zero_level_set_crosses_edge(v1, v2, f_function) -> bool:
     if f_v1 * f_v2 < 0:
         return True
 
-    # Refine along the edge
+    # Refine along the edge (lightweight sampling + early exit)
     x1_diff = x1_max_e - x1_min_e
     x2_diff = x2_max_e - x2_min_e
-    steps = max(int(max(x1_diff, x2_diff) * 10), 100)
+    steps = max(int(max(x1_diff, x2_diff) * 8), 64)
 
     if abs(v2[0] - v1[0]) < 1e-10:  # vertical edge
         x1_on_edge = np.full(steps, v1[0])
@@ -375,10 +375,15 @@ def zero_level_set_crosses_edge(v1, v2, f_function) -> bool:
         x1_on_edge = v1[0] + t * (v2[0] - v1[0])
         x2_on_edge = v1[1] + t * (v2[1] - v1[1])
 
-    f_on_edge = np.array(
-        [f_function(np.array([[x1], [x2]])) for x1, x2 in zip(x1_on_edge, x2_on_edge)]
-    )
-    return len(np.where(np.diff(np.sign(f_on_edge)) != 0)[0]) > 0
+    prev = float(f_function(np.array([[x1_on_edge[0]], [x2_on_edge[0]]])))
+    prev_sign = np.sign(prev)
+    for x1, x2 in zip(x1_on_edge[1:], x2_on_edge[1:]):
+        cur = float(f_function(np.array([[x1], [x2]])))
+        cur_sign = np.sign(cur)
+        if prev_sign * cur_sign < 0:
+            return True
+        prev_sign = cur_sign
+    return False
 
 
 def amsden_hirt_grid(
@@ -552,8 +557,14 @@ class Polygon:
         R : ndarray, shape (2, 2)
             Rotation matrix.
         """
-        theta = -np.arctan2(gradient_vec[1][0], gradient_vec[0][0])
-        R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+        grad_flat = np.asarray(gradient_vec, dtype=float).reshape(-1)
+        if grad_flat.size < 2:
+            raise ValueError(
+                f"gradient_vec must have at least 2 entries, got shape {np.asarray(gradient_vec).shape}"
+            )
+        gx, gy = float(grad_flat[0]), float(grad_flat[1])
+        theta = -np.arctan2(gy, gx)
+        R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]], dtype=float)
         return theta, R
 
     def check_gradient(
@@ -562,136 +573,96 @@ class Polygon:
         B_vector: np.ndarray,
         W_out_vec: np.ndarray,
         dynamics: nn.Module,
-        max_refinements: int = 10,
+        max_refinements: int | None = None,
     ):
-        """Find counterexample points inside this polygon.
+        """Detect a polygon counterexample using rf1 sign-region logic.
 
-        Computes the analytic gradient at the centroid, rotates the coordinate
-        frame so the gradient aligns with E_1, counts how many distinct sign
-        regions of the rotated dynamics exist in the polygon, then uses an
-        Amsden-Hirt grid to find one representative point per region. Points
-        where the rotated f1 component is positive (V_dot >= 0) are returned
-        as counterexamples.
-
-        Parameters
-        ----------
-        W_matrix : ndarray, shape (input_dim, hidden_dim)
-        B_vector : ndarray, shape (hidden_dim,)
-        W_out_vec : ndarray, shape (hidden_dim,)
-        dynamics : nn.Module
-        max_refinements : int
-            Maximum grid refinement iterations when searching for sign regions.
-
-        Returns
-        -------
-        counterexamples : list of (float, float) tuples
+        Rules:
+        1) If rf1 intersects any polygon edge, target region count is 2; else 1.
+        2) For target=1, do not discretize: test centroid only.
+        3) For target=2, discretize polygon bounds and return the first interior,
+           non-edge point with rf1 >= 0.
         """
-        # print("start gradient function")
-        E_2 = np.array([[0.0], [1.0]])
-        centroid_pt = np.array([[self.centroid[0]], [self.centroid[1]]])
+        centroid_x = float(self.centroid[0])
+        centroid_y = float(self.centroid[1])
+        x_col = np.array([[centroid_x], [centroid_y]])
+        grad = analytic_gradient(W_matrix, B_vector, W_out_vec, x_col)
+        g1, g2 = float(grad[0, 0]), float(grad[1, 0])
 
-        U = analytic_gradient(W_matrix, B_vector, W_out_vec, centroid_pt)
-        theta, R = self.rotate(U)
-        rotated_U = R @ U
-        # print("got rotated gradient")
-        # Sanity check: rotated gradient should be close to E_1
-        if np.dot(rotated_U.T, E_2) > 1e-3 and rotated_U[0][0] < 0:
-            print("Warning: rotated gradient is not close to E_1")
+        # ── Zero-gradient early exit ──────────────────────────────────────────
+        # If ∇V = 0 then V is constant in this polygon, so V_dot = ∇V · f = 0
+        # everywhere — V is not strictly decreasing.  The rotation framework
+        # below is undefined (no direction to align with E_1), and would
+        # fall through to checking rf1 = f1, which is unrelated to V_dot.
+        # Return the centroid as a counterexample immediately.
+        if np.linalg.norm(grad) < 1e-10:
+            return [(float(self.centroid[0]), float(self.centroid[1]))]
 
-        # Component callables from dynamics module
-        def f1(x):
-            return _dynamics_numpy(dynamics, x)[0]
+        theta = -np.arctan2(g2, g1)
+        cos_t = float(np.cos(theta))
+        sin_t = float(np.sin(theta))
 
-        def f2(x):
-            return _dynamics_numpy(dynamics, x)[1]
-
-        # Rotated dynamics
         def rf1(x):
-            return np.cos(theta) * f1(x) - np.sin(theta) * f2(x)
+            f1, f2 = _dynamics_numpy(dynamics, x)
+            return cos_t * f1 - sin_t * f2
 
-        def rf2(x):
-            return np.sin(theta) * f1(x) + np.cos(theta) * f2(x)
+        xs_i = [float(c[0]) for c in self.vertex_coords] + [float(self.vertex_coords[0][0])]
+        ys_i = [float(c[1]) for c in self.vertex_coords] + [float(self.vertex_coords[0][1])]
 
-        # Count the number of distinct sign regions inside this polygon
-        # print("origin check")
-        # TODO: This is specific to Duffing dynamics; needs to be checked differently for generic dynamics
-        origin_inside = is_point_in_polygon(0, 0, self.vertex_coords)
-        num_regions = 4 if origin_inside else 1
-        # print("get how many regions")
-        f1_flag = f2_flag = False
-        n = len(self.vertex_coords)
-        for j in range(n):
-            v1 = self.vertex_coords[j]
-            v2 = self.vertex_coords[(j + 1) % n]
-            if zero_level_set_crosses_edge(v1, v2, rf1):
-                f1_flag = True
-            if zero_level_set_crosses_edge(v1, v2, rf2):
-                f2_flag = True
-            if f1_flag and f2_flag:
+        # Step 1: edge-intersection test for rf1 determines target region count.
+        rf1_crosses_edge = False
+        for j in range(len(xs_i) - 1):
+            x1_start, x2_start = xs_i[j], ys_i[j]
+            x1_end, x2_end = xs_i[j + 1], ys_i[j + 1]
+            if zero_level_set_crosses_edge((x1_start, x2_start), (x1_end, x2_end), rf1):
+                rf1_crosses_edge = True
                 break
+        num_regions = 2 if rf1_crosses_edge else 1
 
-        if not origin_inside:
-            if f1_flag and f2_flag:
-                num_regions = 3
-            elif f1_flag != f2_flag:
-                num_regions = 2
+        # Step 2: one-region case -> centroid-only classification.
+        if num_regions == 1:
+            centroid_val = float(rf1(np.array([[centroid_x], [centroid_y]])))
+            if centroid_val >= 0.0:
+                return [(centroid_x, centroid_y)]
+            return []
 
-        # Search via Amsden-Hirt grid for one representative per sign region
-        # print("amsden-hirt stuff")
-        N1 = N2 = 15
-        found_count = 0
-        counter = 0
-        # print("LOOKING FOR REGIONS...")
-        while found_count < num_regions and counter < max_refinements:
-            # Pass a copy so amsden_hirt_grid's append doesn't corrupt our list
-            X_grid, Y_grid = amsden_hirt_grid(
-                list(self.vertex_coords),
-                N1 * (counter + 1),
-                N2 * (counter + 1),
-            )
-            representative_pts = []
-            sign_list = []
+        # Step 3: two-region case -> discretize bounds and stop at first CEX.
+        del max_refinements  # intentionally unused in discretized variant
 
-            # Extract all interior points as flat arrays and mask out axis points
-            xs = X_grid[1:-1, 1:-1].ravel()
-            ys = Y_grid[1:-1, 1:-1].ravel()
-            mask = (xs != 0) & (ys != 0)
-            xs, ys = xs[mask], ys[mask]
+        def _is_on_edge(px: float, py: float, tol: float = 1e-10) -> bool:
+            for j in range(len(xs_i) - 1):
+                x1_start, y1_start = xs_i[j], ys_i[j]
+                x1_end, y1_end = xs_i[j + 1], ys_i[j + 1]
+                dx = x1_end - x1_start
+                dy = y1_end - y1_start
+                seg_len_sq = dx * dx + dy * dy
+                if seg_len_sq <= tol:
+                    continue
+                t = ((px - x1_start) * dx + (py - y1_start) * dy) / seg_len_sq
+                if t < -tol or t > 1.0 + tol:
+                    continue
+                proj_x = x1_start + t * dx
+                proj_y = y1_start + t * dy
+                dist_sq = (px - proj_x) ** 2 + (py - proj_y) ** 2
+                if dist_sq <= tol * tol:
+                    return True
+            return False
 
-            if len(xs) > 0:
-                # Batched dynamics evaluation: one forward pass for all points
-                pts = torch.tensor(np.stack([xs, ys], axis=1), dtype=torch.float32)
-                with torch.no_grad():
-                    out = dynamics(pts)
-                f1_vals = out[:, 0].numpy()
-                f2_vals = out[:, 1].numpy()
+        x1_poly = np.linspace(min(xs_i), max(xs_i), 100)
+        x2_poly = np.linspace(min(ys_i), max(ys_i), 100)
+        for x1 in x1_poly:
+            for x2 in x2_poly:
+                x1f = float(x1)
+                x2f = float(x2)
+                if _is_on_edge(x1f, x2f):
+                    continue
+                if not is_point_in_polygon(x1f, x2f, self.vertex_coords):
+                    continue
+                x_point = np.array([[x1f], [x2f]])
+                if float(rf1(x_point)) >= 0.0:
+                    return [(x1f, x2f)]
 
-                # Apply rotation to all points
-                rf1_vals = np.cos(theta) * f1_vals - np.sin(theta) * f2_vals
-                rf2_vals = np.sin(theta) * f1_vals + np.cos(theta) * f2_vals
-
-                # Find one representative per distinct sign pair
-                for i in range(len(xs)):
-                    sign_pair = (np.sign(rf1_vals[i]), np.sign(rf2_vals[i]))
-                    if sign_pair not in sign_list:
-                        sign_list.append(sign_pair)
-                        representative_pts.append((xs[i], ys[i]))
-                        found_count += 1
-                        if found_count == num_regions:
-                            break
-            counter += 1
-
-        if found_count < num_regions:
-            print(
-                f"Warning: found {found_count}/{num_regions} sign regions after "
-                f"{counter} refinements at centroid "
-                f"({self.centroid[0]:.4f}, {self.centroid[1]:.4f})"
-            )
-
-        # Counterexamples: regions where rotated f1 > 0  (V_dot >= 0)
-        return [
-            representative_pts[j] for j, signs in enumerate(sign_list) if signs[0] > 0
-        ]
+        return []
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
@@ -775,6 +746,7 @@ def full_method(
         for node_list in polygon_node_lists
     ]
     with Pool() as pool:
+        print(f"Using {pool._processes} parallel workers...")
         results = pool.map(_check_poly_worker, work_items)
     counterexamples = [cex for batch in results for cex in batch]
     print(
