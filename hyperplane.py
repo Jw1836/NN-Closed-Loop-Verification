@@ -607,7 +607,7 @@ class Polygon:
         B_vector: np.ndarray,
         W_out_vec: np.ndarray,
         dynamics: nn.Module,
-        max_refinements: int | None = None,
+        max_refinements: int = 4,
     ):
         """Find counterexample points inside this polygon.
 
@@ -760,9 +760,8 @@ class Polygon:
         # Cap the number of refinements to avoid an infinite loop; if
         # exhausted, return the centroid as a conservative counterexample —
         # rf1_crosses already confirmed a violation exists in this polygon.
-        _max_ref = max_refinements if max_refinements is not None else 8
         refine = 1
-        while refine <= _max_ref:
+        while refine <= max_refinements:
             grid_n = 12 * (2 ** (refine - 1))
             print(f"Amsden-Hirt fallback refine={refine}, grid={grid_n}x{grid_n}")
             X_grid, Y_grid = amsden_hirt_grid(
@@ -811,7 +810,7 @@ class Polygon:
         # rf1_crosses=True guarantees a violation exists on/near this polygon,
         # so return the centroid as a conservative counterexample for CEGIS.
         print(
-            f"Warning: Amsden-Hirt exhausted {_max_ref} refinements; "
+            f"Warning: Amsden-Hirt exhausted {max_refinements} refinements; "
             f"returning centroid as conservative counterexample"
         )
         return [(float(self.centroid[0]), float(self.centroid[1]))]
