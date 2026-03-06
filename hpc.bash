@@ -11,4 +11,4 @@ cd NN-Closed-Loop-Verification
 pwd
 
 # Run
-jupyter nbconvert --clear-output --inplace --execute hpc.ipynb
+python hpc.py
