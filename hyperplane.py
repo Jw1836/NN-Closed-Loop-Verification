@@ -575,186 +575,85 @@ class Polygon:
         dynamics: nn.Module,
         max_refinements: int | None = None,
     ):
-        """Find counterexample points inside this polygon.
+        """Detect a polygon counterexample using rf1 sign-region logic.
 
-        Computes the analytic gradient at the centroid, rotates the coordinate
-        frame so the gradient aligns with E_1, counts how many distinct sign
-        regions of the rotated dynamics exist in the polygon, then uses an
-        Amsden-Hirt grid to find one representative point per region. Points
-        where the rotated f1 component is positive (V_dot >= 0) are returned
-        as counterexamples.
-
-        Parameters
-        ----------
-        W_matrix : ndarray, shape (input_dim, hidden_dim)
-        B_vector : ndarray, shape (hidden_dim,)
-        W_out_vec : ndarray, shape (hidden_dim,)
-        dynamics : nn.Module
-
-        Returns
-        -------
-        counterexamples : list of (float, float) tuples
+        Rules:
+        1) If rf1 intersects any polygon edge, target region count is 2; else 1.
+        2) For target=1, do not discretize: test centroid only.
+        3) For target=2, discretize polygon bounds and return the first interior,
+           non-edge point with rf1 >= 0.
         """
-        # print("start gradient function")
-        E_2 = np.array([[0.0], [1.0]])
-        centroid_pt = np.array([[self.centroid[0]], [self.centroid[1]]])
+        centroid_x = float(self.centroid[0])
+        centroid_y = float(self.centroid[1])
+        x_col = np.array([[centroid_x], [centroid_y]])
+        grad = analytic_gradient(W_matrix, B_vector, W_out_vec, x_col)
+        g1, g2 = float(grad[0, 0]), float(grad[1, 0])
 
-        U = analytic_gradient(W_matrix, B_vector, W_out_vec, centroid_pt)
-        theta, R = self.rotate(U)
-        rotated_U = R @ U
-        # print("got rotated gradient")
-        # Sanity check: rotated gradient should be close to E_1
-        rotated_flat = np.asarray(rotated_U, dtype=float).reshape(-1)
-        if rotated_flat.size >= 2 and (
-            abs(float(rotated_flat[1])) > 1e-3 or float(rotated_flat[0]) < 0
-        ):
-            print("Warning: rotated gradient is not close to E_1")
-
-        # Rotated dynamics (single dynamics call per query point)
+        theta = -np.arctan2(g2, g1)
         cos_t = float(np.cos(theta))
         sin_t = float(np.sin(theta))
 
         def rf1(x):
-            f = _dynamics_numpy(dynamics, x)
-            return cos_t * f[0] - sin_t * f[1]
+            f1, f2 = _dynamics_numpy(dynamics, x)
+            return cos_t * f1 - sin_t * f2
 
-        sign_eps = 1e-7
+        xs_i = [float(c[0]) for c in self.vertex_coords] + [float(self.vertex_coords[0][0])]
+        ys_i = [float(c[1]) for c in self.vertex_coords] + [float(self.vertex_coords[0][1])]
 
-        # Small inward offset used to avoid evaluating exactly on polygon edges.
-        verts_np = np.asarray(self.vertex_coords, dtype=float)
-        x_span = float(np.max(verts_np[:, 0]) - np.min(verts_np[:, 0]))
-        y_span = float(np.max(verts_np[:, 1]) - np.min(verts_np[:, 1]))
-        poly_scale = max(np.hypot(x_span, y_span), 1.0)
-        inward_eps = 1e-4 * poly_scale
-        cx, cy = float(self.centroid[0]), float(self.centroid[1])
-
-        def _inset_toward_centroid(px: float, py: float) -> tuple[float, float]:
-            """Nudge a point slightly inward by moving it toward polygon centroid."""
-            dx = cx - px
-            dy = cy - py
-            dist = float(np.hypot(dx, dy))
-            if dist < 1e-14:
-                return px, py
-            step = min(inward_eps, 0.25 * dist)
-            return px + step * dx / dist, py + step * dy / dist
-
-        # Region count rule: 2 if rf1 zero-level set crosses the polygon boundary,
-        # otherwise 1.
-        rf1_crosses = False
-        crossing_edge = None
-        for i in range(len(self.vertex_coords)):
-            p0 = self.vertex_coords[i]
-            p1 = self.vertex_coords[(i + 1) % len(self.vertex_coords)]
-            if zero_level_set_crosses_edge(p0, p1, rf1):
-                rf1_crosses = True
-                crossing_edge = (p0, p1)
+        # Step 1: edge-intersection test for rf1 determines target region count.
+        rf1_crosses_edge = False
+        for j in range(len(xs_i) - 1):
+            x1_start, x2_start = xs_i[j], ys_i[j]
+            x1_end, x2_end = xs_i[j + 1], ys_i[j + 1]
+            if zero_level_set_crosses_edge((x1_start, x2_start), (x1_end, x2_end), rf1):
+                rf1_crosses_edge = True
                 break
-        num_regions = 2 if rf1_crosses else 1
+        num_regions = 2 if rf1_crosses_edge else 1
 
-        # If only one region, classify using centroid sign of rf1.
+        # Step 2: one-region case -> centroid-only classification.
         if num_regions == 1:
-            cex_val = float(rf1(centroid_pt))
-            if cex_val >= -sign_eps:
-                return [(float(self.centroid[0]), float(self.centroid[1]))]
+            centroid_val = float(rf1(np.array([[centroid_x], [centroid_y]])))
+            if centroid_val >= 0.0:
+                return [(centroid_x, centroid_y)]
             return []
 
-        # If two regions, first try fast probes (slightly inset from edges)
-        # to avoid boundary-induced false positives.
-        probe_points = [(float(self.centroid[0]), float(self.centroid[1]))]
-        for i in range(len(self.vertex_coords)):
-            p0 = self.vertex_coords[i]
-            p1 = self.vertex_coords[(i + 1) % len(self.vertex_coords)]
-            x0, y0 = float(p0[0]), float(p0[1])
-            x1, y1 = float(p1[0]), float(p1[1])
+        # Step 3: two-region case -> discretize bounds and stop at first CEX.
+        del max_refinements  # intentionally unused in discretized variant
 
-            # Slightly-inside midpoint probe for this edge.
-            mx, my = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
-            probe_points.append(_inset_toward_centroid(mx, my))
+        def _is_on_edge(px: float, py: float, tol: float = 1e-10) -> bool:
+            for j in range(len(xs_i) - 1):
+                x1_start, y1_start = xs_i[j], ys_i[j]
+                x1_end, y1_end = xs_i[j + 1], ys_i[j + 1]
+                dx = x1_end - x1_start
+                dy = y1_end - y1_start
+                seg_len_sq = dx * dx + dy * dy
+                if seg_len_sq <= tol:
+                    continue
+                t = ((px - x1_start) * dx + (py - y1_start) * dy) / seg_len_sq
+                if t < -tol or t > 1.0 + tol:
+                    continue
+                proj_x = x1_start + t * dx
+                proj_y = y1_start + t * dy
+                dist_sq = (px - proj_x) ** 2 + (py - proj_y) ** 2
+                if dist_sq <= tol * tol:
+                    return True
+            return False
 
-        if crossing_edge is not None:
-            (x0, y0), (x1, y1) = crossing_edge
-            x0, y0 = float(x0), float(y0)
-            x1, y1 = float(x1), float(y1)
-            v0 = float(rf1(np.array([[x0], [y0]])))
-            v1 = float(rf1(np.array([[x1], [y1]])))
+        x1_poly = np.linspace(min(xs_i), max(xs_i), 100)
+        x2_poly = np.linspace(min(ys_i), max(ys_i), 100)
+        for x1 in x1_poly:
+            for x2 in x2_poly:
+                x1f = float(x1)
+                x2f = float(x2)
+                if _is_on_edge(x1f, x2f):
+                    continue
+                if not is_point_in_polygon(x1f, x2f, self.vertex_coords):
+                    continue
+                x_point = np.array([[x1f], [x2f]])
+                if float(rf1(x_point)) >= 0.0:
+                    return [(x1f, x2f)]
 
-            # If edge endpoints bracket zero, bisection gives a near-zero point quickly.
-            if v0 * v1 < 0.0:
-                lo = np.array([x0, y0], dtype=float)
-                hi = np.array([x1, y1], dtype=float)
-                vlo = v0
-
-                for _ in range(40):
-                    mid = 0.5 * (lo + hi)
-                    vmid = float(rf1(np.array([[mid[0]], [mid[1]]])))
-                    if vmid >= -sign_eps:
-                        inset_pt = _inset_toward_centroid(float(mid[0]), float(mid[1]))
-                        inset_val = float(rf1(np.array([[inset_pt[0]], [inset_pt[1]]])))
-                        if inset_val >= -sign_eps:
-                            return [inset_pt]
-                    if vlo * vmid <= 0.0:
-                        hi = mid
-                    else:
-                        lo = mid
-                        vlo = vmid
-
-        for px, py in probe_points:
-            val = float(rf1(np.array([[px], [py]])))
-            if val >= -sign_eps:
-                return [(px, py)]
-
-        # Fallback ONLY when we expect a CEX exists in this polygon:
-        # rf1 zero-level set crosses the boundary (two-region case), but the
-        # fast method could not find a nonnegative-rf1 representative.
-        if not rf1_crosses:
-            return []
-
-        refine = 1
-        while True:
-            grid_n = 12 * (2 ** (refine - 1))
-            print(f"Amsden-Hirt fallback refine={refine}, grid={grid_n}x{grid_n}")
-            X_grid, Y_grid = amsden_hirt_grid(
-                list(self.vertex_coords),
-                grid_n,
-                grid_n,
-            )
-            X_int = X_grid[1:-1, 1:-1]
-            Y_int = Y_grid[1:-1, 1:-1]
-            rows, cols = X_int.shape
-            if rows == 0 or cols == 0:
-                refine += 1
-                continue
-
-            xs = X_int.ravel()
-            ys = Y_int.ravel()
-            found_point = None
-            chunk_size = 4096
-
-            with torch.no_grad():
-                for start in range(0, xs.size, chunk_size):
-                    end = min(start + chunk_size, xs.size)
-                    pts_chunk = torch.tensor(
-                        np.stack([xs[start:end], ys[start:end]], axis=1),
-                        dtype=torch.float32,
-                    )
-                    out = dynamics(pts_chunk)
-                    f1_vals = out[:, 0].numpy()
-                    f2_vals = out[:, 1].numpy()
-                    rf1_vals = cos_t * f1_vals - sin_t * f2_vals
-                    hits = np.where(rf1_vals >= -sign_eps)[0]
-                    if hits.size > 0:
-                        hit_local = int(hits[0])
-                        found_point = (
-                            float(xs[start + hit_local]),
-                            float(ys[start + hit_local]),
-                        )
-                        break
-
-            if found_point is None:
-                refine += 1
-                continue
-
-            return [found_point]
+        return []
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
