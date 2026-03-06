@@ -7,9 +7,13 @@
 
 # In[ ]:
 
+print("Starting")
 
 import torch
 import numpy as np
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import os
 
@@ -40,6 +44,7 @@ def load_checkpoint(tag):
         print(f"Checkpoint loaded: {path}")
         return data
     return None
+
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -155,7 +160,9 @@ ax.set_title("Hyperplane verification: polygon tessellation + counterexamples")
 ax.set_xlabel("x1")
 ax.set_ylabel("x2")
 plt.tight_layout()
-plt.show()
+fig.savefig(os.path.join(CHECKPOINT_DIR, "initial_verification.png"), dpi=150)
+plt.close(fig)
+print(f"Plot saved: {CHECKPOINT_DIR}/initial_verification.png")
 
 
 # ## Iterate Training
@@ -163,7 +170,9 @@ plt.show()
 # In[ ]:
 
 
-base_grid = torch.tensor(np.stack([x1g.ravel(), x2g.ravel()], axis=1), dtype=torch.float32)
+base_grid = torch.tensor(
+    np.stack([x1g.ravel(), x2g.ravel()], axis=1), dtype=torch.float32
+)
 all_counterexamples: list[tuple] = []
 cex_history: list[list[tuple]] = []  # per-iteration counterexamples for comparison
 start_iteration = 0
@@ -287,5 +296,6 @@ ax.set_title("Distance distribution of counterexamples")
 ax.legend(fontsize=7)
 
 plt.tight_layout()
-plt.show()
-
+fig.savefig(os.path.join(CHECKPOINT_DIR, "cex_history.png"), dpi=150)
+plt.close(fig)
+print(f"Plot saved: {CHECKPOINT_DIR}/cex_history.png")
