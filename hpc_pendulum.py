@@ -16,6 +16,17 @@ from pendulum import PendulumProblem
 from lyapunov import train_lyapunov_2d, lyapunov_loss_function
 from hyperplane import full_method
 
+# ── Hyperparameters ────────────────────────────────────────────────────────────
+HIDDEN_SIZE = 125
+MAX_ITERATIONS = 15
+NUM_EPOCHS = 400
+LEARNING_RATE = 1e-3
+GRID_PTS = 300
+RETRAIN_LR = 4e-4
+CEX_WEIGHT = 10.0
+EPSILON = 1e-5
+# ──────────────────────────────────────────────────────────────────────────────
+
 CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "checkpoints_pendulum")
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
@@ -41,24 +52,8 @@ def load_checkpoint(tag):
         return data
     return None
 
+device = torch.device("cpu")
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-    print(f"Using device: {device}")
-else:
-    device = torch.device("cpu")
-    # raise RuntimeError("CUDA not available.")
-
-
-# ── Hyperparameters ────────────────────────────────────────────────────────────
-HIDDEN_SIZE = 30
-MAX_ITERATIONS = 10
-NUM_EPOCHS = 400
-LEARNING_RATE = 1e-3
-GRID_PTS = 300
-RETRAIN_LR = 3e-4
-CEX_WEIGHT = 10.0
-EPSILON = 1e-5
 # ──────────────────────────────────────────────────────────────────────────────
 
 pend = PendulumProblem(hidden_size=HIDDEN_SIZE)  # region built from physics defaults
@@ -200,6 +195,43 @@ for i in range(start_iteration, MAX_ITERATIONS):
         all_counterexamples=all_counterexamples,
         cex_history=cex_history,
     )
+
+
+# ## Final Verification Plot
+
+pend.to("cpu")
+final_cexs, final_polygons, final_vertex_dict = full_method(pend)
+print(f"\nFinal verification: {len(final_cexs)} counterexample(s) found.")
+
+fig, ax = plt.subplots(figsize=(7, 6))
+with torch.no_grad():
+    V = pend.nn_lyapunov(plot_pts).numpy().reshape(x1g.shape)
+ax.contourf(x1g, x2g, V, levels=20, cmap="viridis", alpha=0.5)
+ax.contour(x1g, x2g, V, levels=20, colors="white", linewidths=0.4, alpha=0.3)
+for poly_nodes in final_polygons:
+    coords = [final_vertex_dict[v] for v in poly_nodes]
+    xs = [c[0] for c in coords] + [coords[0][0]]
+    ys = [c[1] for c in coords] + [coords[0][1]]
+    ax.plot(xs, ys, "k-", linewidth=0.6, alpha=0.5)
+if final_cexs:
+    ax.scatter(
+        [p[0] for p in final_cexs],
+        [p[1] for p in final_cexs],
+        c="red",
+        s=50,
+        zorder=5,
+        label=f"Counterexamples ({len(final_cexs)})",
+    )
+    ax.legend()
+ax.set_xlim(x1_min, x1_max)
+ax.set_ylim(x2_min, x2_max)
+ax.set_title("Final verification: polygon tessellation + counterexamples")
+ax.set_xlabel("theta (rad)")
+ax.set_ylabel("theta_dot (rad/s)")
+plt.tight_layout()
+fig.savefig(os.path.join(CHECKPOINT_DIR, "final_verification.png"), dpi=150)
+plt.close(fig)
+print(f"Plot saved: {CHECKPOINT_DIR}/final_verification.png")
 
 
 # ## Counterexample History Plot
