@@ -75,11 +75,13 @@ def lyapunov_loss_function(
     with torch.no_grad():
         f_vec = dynamics(x_train_2d)
     lie_derivative = torch.sum(grad_V * f_vec, dim=1)
-    lie_penalty = torch.relu(lie_derivative + 1e-6).mean()
+    lie_penalty = torch.relu(lie_derivative + 1e-3).mean()
 
-    # 4. Flatness penalty
+    # 4. Flatness penalty — ReLU ensures this only fires when V is too flat,
+    # not when V is already large (without ReLU the term goes unboundedly negative
+    # once the bowl shape is established, destabilizing the other terms).
     x_norm = torch.linalg.vector_norm(x_train_2d, dim=1, keepdim=True)
-    flatness_penalty = (x_norm - alpha * V_x).mean()
+    flatness_penalty = torch.relu(x_norm - alpha * V_x).mean()
 
     return origin_penalty + positive_penalty + lie_penalty + flatness_penalty
 
