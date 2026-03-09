@@ -42,7 +42,9 @@ class LyapunovProblem:
         )
 
 
-def lyapunov_loss_function(x_train_2d, practice_nn, dynamics: nn.Module, alpha: float = 0.1):
+def lyapunov_loss_function(
+    x_train_2d, practice_nn, dynamics: nn.Module, alpha: float = 0.1
+):
     """Composite Lyapunov training loss.
 
     Penalises:
@@ -83,7 +85,12 @@ def lyapunov_loss_function(x_train_2d, practice_nn, dynamics: nn.Module, alpha: 
 
 
 def train_model_lyapunov_general(
-    model, x_train_2d, num_epochs, learning_rate, dynamics: nn.Module, alpha: float = 1.0
+    model,
+    x_train_2d,
+    num_epochs,
+    learning_rate,
+    dynamics: nn.Module,
+    alpha: float = 1.0,
 ):
     """Train a neural Lyapunov function using the composite Lyapunov loss."""
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -161,7 +168,7 @@ def train_lyapunov_2d(
     grid_pts: int = 50,
     num_epochs: int = 100,
     learning_rate: float = 1e-3,
-    alpha: float = 1.0
+    alpha: float = 1.0,
 ):
     # Names easier to work with
     x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()

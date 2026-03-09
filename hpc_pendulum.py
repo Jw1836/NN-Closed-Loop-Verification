@@ -3,6 +3,7 @@
 
 print("Starting")
 
+import csv
 import torch
 import numpy as np
 import matplotlib
@@ -18,7 +19,7 @@ from hyperplane import full_method
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 HIDDEN_SIZE = 125
-MAX_ITERATIONS = 15
+MAX_ITERATIONS = 10
 NUM_EPOCHS = 400
 LEARNING_RATE = 1e-3
 GRID_PTS = 300
@@ -29,6 +30,19 @@ EPSILON = 1e-5
 
 CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "checkpoints_pendulum")
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+CEX_LOG = os.path.join(CHECKPOINT_DIR, "counterexample_log.csv")
+
+
+def append_cex_log(iteration: int, cexs: list[tuple]):
+    """Append counterexamples (x1, x2, V_dot) for this iteration to the CSV log."""
+    write_header = not os.path.exists(CEX_LOG)
+    with open(CEX_LOG, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(["iteration", "x1", "x2", "dVx"])
+        for p in cexs:
+            writer.writerow([iteration, p[0], p[1], p[2]])
 
 
 def save_checkpoint(tag, problem, **extra):
@@ -51,6 +65,7 @@ def load_checkpoint(tag):
         print(f"Checkpoint loaded: {path}")
         return data
     return None
+
 
 device = torch.device("cpu")
 
@@ -155,6 +170,8 @@ for i in range(start_iteration, MAX_ITERATIONS):
         print("No counterexamples — done.")
         break
 
+    append_cex_log(i, counterexamples2)
+
     seen = {(round(p[0], 6), round(p[1], 6)) for p in all_counterexamples}
     for p in counterexamples2:
         key = (round(p[0], 6), round(p[1], 6))
@@ -163,7 +180,9 @@ for i in range(start_iteration, MAX_ITERATIONS):
             seen.add(key)
     print(f"  {len(all_counterexamples)} total accumulated counterexamples.")
 
-    cex_tensor = torch.tensor(all_counterexamples, dtype=torch.float32)
+    # Strip dVx column — training expects 2D state inputs
+    cex_xy = [(p[0], p[1]) for p in all_counterexamples]
+    cex_tensor = torch.tensor(cex_xy, dtype=torch.float32)
     pend.to(device)
     grid_dev = base_grid.to(device)
     cex_dev = cex_tensor.to(device)

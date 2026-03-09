@@ -564,7 +564,10 @@ class Polygon:
             )
         gx, gy = float(grad_flat[0]), float(grad_flat[1])
         theta = -np.arctan2(gy, gx)
-        R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]], dtype=float)
+        R = np.array(
+            [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]],
+            dtype=float,
+        )
         return theta, R
 
     def check_gradient(
@@ -596,7 +599,7 @@ class Polygon:
         # fall through to checking rf1 = f1, which is unrelated to V_dot.
         # Return the centroid as a counterexample immediately.
         if np.linalg.norm(grad) < 1e-10:
-            return [(float(self.centroid[0]), float(self.centroid[1]))]
+            return [(float(self.centroid[0]), float(self.centroid[1]), 0.0)]
 
         theta = -np.arctan2(g2, g1)
         cos_t = float(np.cos(theta))
@@ -606,8 +609,12 @@ class Polygon:
             f1, f2 = _dynamics_numpy(dynamics, x)
             return cos_t * f1 - sin_t * f2
 
-        xs_i = [float(c[0]) for c in self.vertex_coords] + [float(self.vertex_coords[0][0])]
-        ys_i = [float(c[1]) for c in self.vertex_coords] + [float(self.vertex_coords[0][1])]
+        xs_i = [float(c[0]) for c in self.vertex_coords] + [
+            float(self.vertex_coords[0][0])
+        ]
+        ys_i = [float(c[1]) for c in self.vertex_coords] + [
+            float(self.vertex_coords[0][1])
+        ]
 
         # Step 1: edge-intersection test for rf1 determines target region count.
         rf1_crosses_edge = False
@@ -621,9 +628,12 @@ class Polygon:
 
         # Step 2: one-region case -> centroid-only classification.
         if num_regions == 1:
-            centroid_val = float(rf1(np.array([[centroid_x], [centroid_y]])))
+            x_c = np.array([[centroid_x], [centroid_y]])
+            centroid_val = float(rf1(x_c))
             if centroid_val >= 0.0:
-                return [(centroid_x, centroid_y)]
+                f1_c, f2_c = _dynamics_numpy(dynamics, x_c)
+                vdot = g1 * float(f1_c) + g2 * float(f2_c)
+                return [(centroid_x, centroid_y, vdot)]
             return []
 
         # Step 3: two-region case -> discretize bounds and stop at first CEX.
@@ -660,7 +670,9 @@ class Polygon:
                     continue
                 x_point = np.array([[x1f], [x2f]])
                 if float(rf1(x_point)) >= 0.0:
-                    return [(x1f, x2f)]
+                    f1_p, f2_p = _dynamics_numpy(dynamics, x_point)
+                    vdot_p = g1 * float(f1_p) + g2 * float(f2_p)
+                    return [(x1f, x2f, vdot_p)]
 
         return []
 
@@ -676,7 +688,7 @@ def _check_poly_worker(args):
 
 def full_method(
     problem: LyapunovProblem,
-) -> tuple[list[tuple[float, float]], list[str], dict[str, np.ndarray]]:
+) -> tuple[list[tuple[float, float, float]], list[str], dict[str, np.ndarray]]:
     """End-to-end hyperplane verification pipeline.
 
     Parameters
@@ -690,7 +702,7 @@ def full_method(
 
     Returns
     -------
-    counterexamples : list of (float, float)
+    counterexamples : list of (float, float, float)  — (x1, x2, V_dot)
     polygons : list of list[str]   (ordered vertex-name lists)
     vertex_dict : dict[str, array-like]
     """
