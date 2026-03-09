@@ -20,12 +20,12 @@ from hyperplane import full_method
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 HIDDEN_SIZE = 30
 MAX_ITERATIONS = 5
-NUM_EPOCHS = 400
+NUM_EPOCHS = 800
 LEARNING_RATE = 1e-3
 GRID_PTS = 300
 RETRAIN_LR = 4e-4
 CEX_WEIGHT = 10.0
-EPSILON = 0.01  # radius: skip counterexamples within this distance of origin
+EPSILON = 1e-4  # radius: skip counterexamples within this distance of origin
 CEX_WINDOW = 3  # retrain on current + this many prior iterations
 # ──────────────────────────────────────────────────────────────────────────────
 
