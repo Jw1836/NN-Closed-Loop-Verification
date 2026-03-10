@@ -22,22 +22,28 @@ class LyapunovProblem:
     def state_dim(self) -> int:
         return self.region.shape[0]
 
-    def to(self, device: str | torch.device) -> None:
-        """Move nn_lyapunov, dynamics, and region to the same given device."""
+    def to(self, device: str | torch.device) -> "LyapunovProblem":
+        """Move nn_lyapunov and dynamics to *device*.
+
+        Region stays on CPU — it only holds float bounds accessed via .item()
+        and never participates in GPU computation.
+        """
         self.nn_lyapunov.to(device)
         self.dynamics.to(device)
-        self.region.to(device)
+        return self
 
     def __repr__(self) -> str:
         region_str = ", ".join(
             f"x{i + 1} ∈ [{self.region[i, 0].item():.3g}, {self.region[i, 1].item():.3g}]"
             for i in range(self.state_dim)
         )
+        hidden_size = getattr(self.nn_lyapunov, "hidden_size", None)
+        hidden_str = f", hidden_size={hidden_size}" if hidden_size is not None else ""
         return (
             f"{self.__class__.__name__}("
             f"state_dim={self.state_dim}, "
             f"region=[{region_str}], "
-            f"lyapunov={self.nn_lyapunov.__class__.__name__}, "
+            f"lyapunov={self.nn_lyapunov.__class__.__name__}{hidden_str}, "
             f"dynamics={self.dynamics.__class__.__name__})"
         )
 

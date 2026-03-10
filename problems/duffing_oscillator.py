@@ -46,6 +46,7 @@ class DuffingLyapunov(nn.Module):
         `.network[0]` (input Linear) and `.network[2]` (output Linear).
         """
         super().__init__()
+        self.hidden_size = hidden_size
         self.network = nn.Sequential(
             nn.Linear(2, hidden_size), nn.ReLU(), nn.Linear(hidden_size, 1)
         )

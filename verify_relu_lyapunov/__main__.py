@@ -36,7 +36,9 @@ def save_checkpoint(checkpoint_dir: str, tag: str, problem: LyapunovProblem, **e
     path = os.path.join(checkpoint_dir, f"{tag}.pt")
     torch.save(
         {
-            "model_state": problem.nn_lyapunov.state_dict(),
+            "model_state": {
+                k: v.cpu() for k, v in problem.nn_lyapunov.state_dict().items()
+            },
             "region": problem.region,
             **extra,
         },
@@ -75,6 +77,10 @@ def load_problem_module(problem_path: str):
         sys.exit(1)
 
     # Derive a stable module name so multiprocessing can pickle classes from it.
+    # Also add the file's directory to sys.path so spawned workers can import it.
+    mod_dir = os.path.dirname(path)
+    if mod_dir not in sys.path:
+        sys.path.insert(0, mod_dir)
     mod_name = os.path.splitext(os.path.basename(path))[0]
     spec = importlib.util.spec_from_file_location(mod_name, path)
     mod = importlib.util.module_from_spec(spec)
@@ -240,7 +246,6 @@ def main():
 
     # ── Load problem ──────────────────────────────────────────────────────────
     problem = load_problem_module(args.problem_file)
-    print(problem)
 
     # ── Checkpoint dir ────────────────────────────────────────────────────────
     if args.checkpoint_dir is None:
@@ -253,12 +258,29 @@ def main():
 
     device = torch.device(args.device)
 
+    # ── Print config ──────────────────────────────────────────────────────────
+    n_params = sum(p.numel() for p in problem.nn_lyapunov.parameters())
+    hidden_size = getattr(problem.nn_lyapunov, "hidden_size", "?")
+    print(f"Problem:        {problem}")
+    print(f"Lyapunov net:   hidden_size={hidden_size}  params={n_params:,}")
+    print(f"Dynamics:       {problem.dynamics}")
+    print(f"Device:         {device}")
+    print(f"Checkpoint dir: {checkpoint_dir}")
+    print(
+        f"Config:         epochs={args.epochs}  lr={args.lr}  grid={args.grid_pts}"
+        f"  retrain_lr={args.retrain_lr}  cex_weight={args.cex_weight}"
+        f"  epsilon={args.epsilon}  cex_window={args.cex_window}"
+        f"  max_iter={args.max_iterations}"
+    )
+    print()
+
     # ── Initial training (or resume) ──────────────────────────────────────────
     ckpt = load_checkpoint(checkpoint_dir, "initial_train")
     if ckpt is not None:
         problem.nn_lyapunov.load_state_dict(ckpt["model_state"])
         print("Skipping initial training — loaded from checkpoint.")
     else:
+        problem.to(device)
         train_lyapunov_2d(
             problem,
             grid_pts=args.grid_pts,
