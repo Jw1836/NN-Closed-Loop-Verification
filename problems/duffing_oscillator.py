@@ -80,9 +80,10 @@ class DuffingProblem(LyapunovProblem):
         )
 
 
-def make_problem() -> LyapunovProblem:
+def make_problem(hidden_size: int = 150, **kwargs) -> LyapunovProblem:
     """Factory function for the CEGIS runner."""
     return DuffingProblem(
         region=torch.tensor([[-3.0, 3.0], [-3.0, 3.0]]),
-        hidden_size=150,
+        hidden_size=hidden_size,
+        **kwargs,
     )

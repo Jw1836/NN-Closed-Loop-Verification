@@ -62,6 +62,6 @@ class BilinearProblem(LyapunovProblem):
         )
 
 
-def make_problem() -> LyapunovProblem:
+def make_problem(hidden_size: int = 30, **kwargs) -> LyapunovProblem:
     """Factory function for the CEGIS runner."""
-    return BilinearProblem(hidden_size=30)
+    return BilinearProblem(hidden_size=hidden_size, **kwargs)

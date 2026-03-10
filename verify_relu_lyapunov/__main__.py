@@ -95,7 +95,7 @@ def load_problem_module(problem_path: str):
         )
         sys.exit(1)
 
-    return mod.make_problem()
+    return mod
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
@@ -241,11 +241,21 @@ def main():
         default=3,
         help="Retrain on current + this many prior iterations",
     )
+    parser.add_argument(
+        "--hidden-size",
+        type=int,
+        default=None,
+        help="Override hidden layer size in the Lyapunov net",
+    )
     parser.add_argument("--device", default="cpu", help="torch device (cpu or cuda)")
     args = parser.parse_args()
 
     # ── Load problem ──────────────────────────────────────────────────────────
-    problem = load_problem_module(args.problem_file)
+    mod = load_problem_module(args.problem_file)
+    kwargs = {}
+    if args.hidden_size is not None:
+        kwargs["hidden_size"] = args.hidden_size
+    problem = mod.make_problem(**kwargs)
 
     # ── Checkpoint dir ────────────────────────────────────────────────────────
     if args.checkpoint_dir is None:

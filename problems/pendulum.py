@@ -103,6 +103,6 @@ class PendulumProblem(LyapunovProblem):
         )
 
 
-def make_problem() -> LyapunovProblem:
+def make_problem(hidden_size: int = 30, **kwargs) -> LyapunovProblem:
     """Factory function for the CEGIS runner."""
-    return PendulumProblem(hidden_size=30)
+    return PendulumProblem(hidden_size=hidden_size, **kwargs)
