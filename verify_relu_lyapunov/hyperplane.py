@@ -19,7 +19,7 @@ import torch
 from multiprocessing import Pool
 from typing import cast
 from torch import nn, Tensor
-from lyapunov import LyapunovProblem
+from .lyapunov import LyapunovProblem
 
 
 # ── Geometry helpers ───────────────────────────────────────────────────────────
