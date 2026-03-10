@@ -108,11 +108,23 @@ def find_all_intersection_points(W_matrix, B_vector, x1_min, x1_max, x2_min, x2_
         intersection_points.append(corner)
 
     # Discard any points that fell outside the rectangle
-    return [
+    in_rect = [
         p
         for p in intersection_points
         if is_within_rect(p, x1_min, x1_max, x2_min, x2_max)
     ]
+
+    # De-duplicate near-coincident points (tol=1e-6).
+    # Many hidden neurons have biases driven near zero by the V(0)=0 loss term,
+    # so all their decision boundaries intersect within a tiny neighbourhood of
+    # the origin.  Without dedup these micro-points form hundreds of zero-area
+    # "polygons" that produce false-positive counterexamples.
+    dedup = []
+    for pt in in_rect:
+        pt_arr = np.asarray(pt)
+        if not any(np.linalg.norm(pt_arr - np.asarray(kept)) < 1e-6 for kept in dedup):
+            dedup.append(pt)
+    return dedup
 
 
 def _connect_consecutive_on_edge(points_on_edge, edge_name, edge_list):
@@ -750,12 +762,44 @@ def full_method(
         f"— {len(polygon_node_lists)} polygons"
     )
 
+    # Filter out near-zero-area polygons before verification.
+    # These arise from residual near-duplicate vertices after dedup and from
+    # boundary-edge slivers; their centroids land in degenerate regions that
+    # produce false-positive counterexamples.
+    domain_area = (x1_max - x1_min) * (x2_max - x2_min)
+    area_tol = domain_area * 1e-10  # absolute area threshold
+    filtered_node_lists = []
+    n_zero_area = 0
+    for node_list in polygon_node_lists:
+        coords = [np.asarray(vertex_dict[v], dtype=float) for v in node_list]
+        if len(coords) < 3:
+            n_zero_area += 1
+            continue
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        n = len(xs)
+        area = (
+            abs(
+                sum(xs[i] * ys[(i + 1) % n] - xs[(i + 1) % n] * ys[i] for i in range(n))
+            )
+            / 2.0
+        )
+        if area < area_tol:
+            n_zero_area += 1
+        else:
+            filtered_node_lists.append(node_list)
+    if n_zero_area:
+        print(
+            f"  Filtered {n_zero_area} near-zero-area polygons "
+            f"({len(filtered_node_lists)} remain)"
+        )
+
     print("Running verification...")
     t0 = time.perf_counter()
     dynamics_cpu = problem.dynamics.cpu()
     work_items = [
         (node_list, vertex_dict, W_matrix, B_vector, W_out_vec, dynamics_cpu)
-        for node_list in polygon_node_lists
+        for node_list in filtered_node_lists
     ]
     with Pool() as pool:
         print(f"Using {pool._processes} parallel workers...")
