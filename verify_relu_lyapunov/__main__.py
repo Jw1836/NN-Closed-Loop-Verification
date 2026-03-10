@@ -189,7 +189,8 @@ def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem)
     ax.set_xlabel("x1")
     ax.set_ylabel("x2")
     ax.set_title("Counterexample locations by iteration")
-    ax.legend(fontsize=7, markerscale=1.5, loc="lower left")
+    if any(cex_history):
+        ax.legend(fontsize=7, markerscale=1.5, loc="lower left")
 
     ax = axes[2]
     for i, cexs in enumerate(cex_history):
@@ -199,7 +200,8 @@ def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem)
     ax.set_xlabel("Distance from origin")
     ax.set_ylabel("Count")
     ax.set_title("Distance distribution of counterexamples")
-    ax.legend(fontsize=7)
+    if any(cex_history):
+        ax.legend(fontsize=7)
 
     plt.tight_layout()
     fig.savefig(os.path.join(checkpoint_dir, "cex_history.png"), dpi=150)
@@ -301,8 +303,13 @@ def main():
 
     # ── Initial verification ──────────────────────────────────────────────────
     problem.to("cpu")
-    counterexamples, polygons, vertex_dict = full_method(problem)
-    print(f"\nResult: {len(counterexamples)} counterexample(s) found.")
+    counterexamples_raw, polygons, vertex_dict = full_method(problem)
+    counterexamples = [
+        p for p in counterexamples_raw if (p[0] ** 2 + p[1] ** 2) >= args.epsilon**2
+    ]
+    n_origin = len(counterexamples_raw) - len(counterexamples)
+    origin_note = f" ({n_origin} near-origin filtered)" if n_origin else ""
+    print(f"\nResult: {len(counterexamples)} counterexample(s){origin_note}.")
 
     plot_verification(
         checkpoint_dir,
@@ -407,8 +414,13 @@ def main():
 
     # ── Final verification ────────────────────────────────────────────────────
     problem.to("cpu")
-    final_cexs, final_polygons, final_vertex_dict = full_method(problem)
-    print(f"\nFinal verification: {len(final_cexs)} counterexample(s) found.")
+    final_cexs_raw, final_polygons, final_vertex_dict = full_method(problem)
+    final_cexs = [
+        p for p in final_cexs_raw if (p[0] ** 2 + p[1] ** 2) >= args.epsilon**2
+    ]
+    n_origin = len(final_cexs_raw) - len(final_cexs)
+    origin_note = f" ({n_origin} near-origin filtered)" if n_origin else ""
+    print(f"\nFinal verification: {len(final_cexs)} counterexample(s){origin_note}.")
 
     plot_verification(
         checkpoint_dir,
