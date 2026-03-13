@@ -5,7 +5,9 @@ import plotly.graph_objects as go
 from hyperplane import extract_weights, analytic_gradient
 
 
-def _verify_point_with_dynamics(W_matrix, B_vector, W_out_vec, x1_val, x2_val, dynamics_list):
+def _verify_point_with_dynamics(
+    W_matrix, B_vector, W_out_vec, x1_val, x2_val, dynamics_list
+):
     x_state = np.array([[x1_val], [x2_val]])
     V_grad = analytic_gradient(W_matrix, B_vector, W_out_vec, x_state)
 
@@ -13,7 +15,7 @@ def _verify_point_with_dynamics(W_matrix, B_vector, W_out_vec, x1_val, x2_val, d
     f2 = dynamics_list[1](x_state)
 
     dot_product = V_grad[0, 0] * f1 + V_grad[1, 0] * f2
-    if(dot_product >= 0):
+    if dot_product >= 0:
         return False
     else:
         return True
@@ -61,7 +63,11 @@ def make_CEX_plot_comp(
     X1_grid, X2_grid = np.meshgrid(x1_vals, x2_vals)
     grid_points = np.stack([X1_grid.ravel(), X2_grid.ravel()], axis=1)
     with torch.no_grad():
-        V_values = my_nn(torch.tensor(grid_points, dtype=torch.float32)).numpy().reshape(X1_grid.shape)
+        V_values = (
+            my_nn(torch.tensor(grid_points, dtype=torch.float32))
+            .numpy()
+            .reshape(X1_grid.shape)
+        )
 
     fig.add_trace(
         go.Contour(

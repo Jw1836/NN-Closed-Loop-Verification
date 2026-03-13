@@ -91,7 +91,7 @@ class PendulumProblem(LyapunovProblem):
         dynamics = PendulumDynamics(**kwargs)
         # Intelligently construct the region if not explicitly given
         if region is None:
-            theta_lim = math.pi / 2
+            theta_lim = math.pi / 4
             theta_dot_lim = math.sqrt(PendulumDynamics.G / dynamics.L)
             region = torch.tensor(
                 [[-theta_lim, theta_lim], [-theta_dot_lim, theta_dot_lim]]
