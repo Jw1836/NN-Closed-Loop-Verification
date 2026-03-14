@@ -2,8 +2,6 @@
 that verifiers and the Lyapunov network are handed."""
 
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
-import numpy as np
 import torch
 from torch import nn, Tensor
 

@@ -18,7 +18,7 @@ import igraph as ig
 import torch
 from multiprocessing import Pool
 from typing import cast
-from torch import nn, Tensor
+from torch import nn
 from .lyapunov import LyapunovProblem
 
 
