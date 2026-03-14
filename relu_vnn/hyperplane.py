@@ -4,258 +4,229 @@ hyperplane_verifier.py
 Hyperplane arrangement verification for neural Lyapunov functions.
 
 Pipeline:
-  1. find_all_intersection_points  - ReLU hyperplane x hyperplane + domain edges
-  2. get_planar_graph              - build planar graph from intersection points
-  3. polygons_from_igraph_mcb      - extract polygon faces via minimum cycle basis
-  4. Polygon.check_gradient        - rotate, count sign regions, run Amsden-Hirt grid
-  5. full_method                   - top-level orchestrator; returns counterexamples
+  1. enumerate_cells_bfs           - BFS over activation patterns to find all cells
+  2. Polygon.check_gradient        - rotate, count sign regions, check dynamics
+  3. full_method                   - top-level orchestrator; returns counterexamples
 """
 
 import time
+from collections import deque
+
 import numpy as np
-import networkx as nx
-import igraph as ig
 import torch
+from scipy.optimize import linprog
+from scipy.spatial import ConvexHull, HalfspaceIntersection
 from multiprocessing import Pool
-from typing import cast
+from typing import Callable, Sequence, cast
 from torch import nn
 from .lyapunov import LyapunovProblem
 
+# Type aliases
+ActivationPattern = tuple[bool, ...]
+Vertex2D = Sequence[float] | np.ndarray  # (x1, x2)
+Counterexample = tuple[float, float, float]  # (x1, x2, V_dot)
 
-# ── Geometry helpers ───────────────────────────────────────────────────────────
+
+# ── Cell enumeration via BFS over activation patterns ─────────────────────────
 
 
-def is_within_rect(point, x1_min, x1_max, x2_min, x2_max, tol=1e-8):
-    """Return True if point lies inside (or on) the axis-aligned rectangle."""
-    return (x1_min - tol <= point[0] <= x1_max + tol) and (
-        x2_min - tol <= point[1] <= x2_max + tol
+def compute_activation_pattern(
+    W_matrix: np.ndarray, B_vector: np.ndarray, x: np.ndarray
+) -> ActivationPattern:
+    """Return the activation pattern (tuple of bools) at point x."""
+    # W_matrix.T @ x + B_vector gives pre-activations for all neurons
+    pre = W_matrix.T @ x + B_vector
+    # Did the ReLU fire or not?
+    return tuple(bool(v >= 0) for v in pre)
+
+
+def build_bbox_halfspaces(
+    x1_min: float, x1_max: float, x2_min: float, x2_max: float
+) -> np.ndarray:
+    """Build bounding box halfspaces in the form [a1, a2, b] where a·x + b <= 0."""
+    return np.array(
+        [
+            [-1.0, 0.0, x1_min],  # x1 >= x1_min  =>  -x1 + x1_min <= 0
+            [1.0, 0.0, -x1_max],  # x1 <= x1_max  =>   x1 - x1_max <= 0
+            [0.0, -1.0, x2_min],  # x2 >= x2_min  =>  -x2 + x2_min <= 0
+            [0.0, 1.0, -x2_max],  # x2 <= x2_max  =>   x2 - x2_max <= 0
+        ]
     )
 
 
-def find_intersection(plane_1_normal, plane_1_bias, plane_2_normal, plane_2_bias):
-    """Solve for the intersection of two lines given in normal/bias form.
+def build_cell_halfspaces(
+    W_matrix: np.ndarray,
+    B_vector: np.ndarray,
+    bbox_hs: np.ndarray,
+    pattern: ActivationPattern,
+) -> np.ndarray:
+    """Build halfspaces for a polyhedral cell with the given activation pattern.
 
-    Line equation: normal . x + bias = 0
-    Returns None if the lines are parallel (det < tol).
+    Each neuron i contributes: if active, -w_i·x - b_i <= 0; if inactive, w_i·x + b_i <= 0.
+    Combined with the 4 bounding-box halfspaces.
     """
-    A = np.array([plane_1_normal, plane_2_normal])
-    det = np.linalg.det(A)
-    tol = 1e-6
-    if abs(det) < tol:
-        return None
-    b = np.array([-plane_1_bias, -plane_2_bias])
-    return np.linalg.solve(A, b)
+    n_hidden = W_matrix.shape[1]
+    hs = np.empty((n_hidden + 4, 3))  # each neuron + 4 bounds from original region
+    hs[:4] = bbox_hs
+    for i in range(n_hidden):
+        w = W_matrix[:, i]
+        b = B_vector[i]
+        if pattern[i]:  # active: w·x + b >= 0  =>  -w·x - b <= 0
+            hs[4 + i] = [-w[0], -w[1], -b]
+        else:  # inactive: w·x + b <= 0
+            hs[4 + i] = [w[0], w[1], b]
+    return hs
 
 
-def find_all_intersection_points(W_matrix, B_vector, x1_min, x1_max, x2_min, x2_max):
-    """Find all pairwise intersections of ReLU hyperplanes, plus their
-    intersections with the four domain edges, clipped to the rectangle.
+def find_chebyshev_center(halfspaces: np.ndarray) -> np.ndarray | None:
+    """Find a strictly interior point via the Chebyshev center LP.
 
-    Parameters
-    ----------
-    W_matrix : ndarray, shape (input_dim, hidden_dim)
-        Columns are weight vectors into each hidden neuron.
-    B_vector : ndarray, shape (hidden_dim,)
-        Biases of the hidden layer.
-    x1_min, x1_max, x2_min, x2_max : float
-        Domain bounds.
+    Maximizes the inscribed ball radius r subject to a_j·x + b_j + ||a_j||·r <= 0.
+    Each row of *halfspaces* is ``[a1, a2, b]`` defining ``a·x + b <= 0``.
+    Returns shape ``(2,)`` or ``None`` if infeasible.
+
+    This is a slightly more expensive but robust way to find an interior point.
+    It has the advantage of returning ``None`` for infeasible solutions,
+    meaning they have effectively zero area.
     """
-    intersection_points = []
+    A_hs = halfspaces[:, :2]
+    b_hs = halfspaces[:, 2]
+    norms = np.linalg.norm(A_hs, axis=1, keepdims=True)
 
-    # Pairwise intersections of hyperplanes
-    for i in range(W_matrix.shape[1]):
-        w_i = W_matrix[:, i]
-        b_i = B_vector[i]
-        for j in range(i + 1, W_matrix.shape[1]):
-            w_j = W_matrix[:, j]
-            b_j = B_vector[j]
-            pt = find_intersection(w_i, b_i, w_j, b_j)
-            if pt is not None:
-                intersection_points.append(pt)
+    # LP: minimize -r  subject to  A_hs @ x + norms * r <= -b_hs, r >= 0
+    A_lp = np.hstack([A_hs, norms])
+    b_lp = -b_hs
+    c = np.array([0.0, 0.0, -1.0])
 
-    # Intersections of each hyperplane with the four rectangle edges
-    for i in range(W_matrix.shape[1]):
-        w_i = W_matrix[:, i]
-        b_i = B_vector[i]
-
-        # Bottom edge: x2 = x2_min  →  [0,1]·x + (-x2_min) = 0
-        pt = find_intersection(w_i, b_i, np.array([0, 1]), -x2_min)
-        if pt is not None and is_within_rect(pt, x1_min, x1_max, x2_min, x2_max):
-            intersection_points.append(pt)
-
-        # Top edge: x2 = x2_max
-        pt = find_intersection(w_i, b_i, np.array([0, 1]), -x2_max)
-        if pt is not None and is_within_rect(pt, x1_min, x1_max, x2_min, x2_max):
-            intersection_points.append(pt)
-
-        # Left edge: x1 = x1_min  →  [1,0]·x + (-x1_min) = 0
-        pt = find_intersection(w_i, b_i, np.array([1, 0]), -x1_min)
-        if pt is not None and is_within_rect(pt, x1_min, x1_max, x2_min, x2_max):
-            intersection_points.append(pt)
-
-        # Right edge: x1 = x1_max
-        pt = find_intersection(w_i, b_i, np.array([1, 0]), -x1_max)
-        if pt is not None and is_within_rect(pt, x1_min, x1_max, x2_min, x2_max):
-            intersection_points.append(pt)
-
-    # Add the four rectangle corners
-    for corner in [
-        (x1_min, x2_min),
-        (x1_min, x2_max),
-        (x1_max, x2_min),
-        (x1_max, x2_max),
-    ]:
-        intersection_points.append(corner)
-
-    # Discard any points that fell outside the rectangle
-    in_rect = [
-        p
-        for p in intersection_points
-        if is_within_rect(p, x1_min, x1_max, x2_min, x2_max)
-    ]
-
-    # De-duplicate near-coincident points (tol=1e-6).
-    # Many hidden neurons have biases driven near zero by the V(0)=0 loss term,
-    # so all their decision boundaries intersect within a tiny neighbourhood of
-    # the origin.  Without dedup these micro-points form hundreds of zero-area
-    # "polygons" that produce false-positive counterexamples.
-    dedup = []
-    for pt in in_rect:
-        pt_arr = np.asarray(pt)
-        if not any(np.linalg.norm(pt_arr - np.asarray(kept)) < 1e-6 for kept in dedup):
-            dedup.append(pt)
-    return dedup
+    result = linprog(
+        c,
+        A_ub=A_lp,
+        b_ub=b_lp,
+        bounds=[(None, None), (None, None), (0, None)],
+        method="highs",
+    )
+    if result.success and result.x[2] > 1e-10:
+        return result.x[:2]
+    return None
 
 
-def _connect_consecutive_on_edge(points_on_edge, edge_name, edge_list):
-    """Sort points along one rectangle edge and connect consecutive pairs."""
-    if len(points_on_edge) < 2:
-        return edge_list
-    if edge_name in ("left", "right"):
-        points_on_edge.sort(key=lambda p: p[1][1])  # sort by x2
-    else:
-        points_on_edge.sort(key=lambda p: p[1][0])  # sort by x1
-    for k in range(len(points_on_edge) - 1):
-        edge_list.append((points_on_edge[k][0], points_on_edge[k + 1][0]))
-    return edge_list
+def enumerate_cells_bfs(
+    W_matrix: np.ndarray,
+    B_vector: np.ndarray,
+    bbox_hs: np.ndarray,
+    x1_min: float,
+    x1_max: float,
+    x2_min: float,
+    x2_max: float,
+) -> list[np.ndarray]:
+    """Enumerate all non-empty cells of the ReLU hyperplane arrangement via BFS.
 
+    Each hidden neuron defines a hyperplane ``w_i · x + b_i = 0`` that splits
+    the domain into two half-spaces.  A *cell* is the intersection of one
+    half-space per neuron (the "activation pattern") with the bounding box —
+    i.e. the region where a specific set of ReLUs are on/off.  Within each
+    cell the network is affine, so ``∇V`` is constant.
 
-def get_planar_graph(
-    intersection_points, W_matrix, B_vector, x1_min, x1_max, x2_min, x2_max, tol=1e-6
-):
-    """Build the planar graph whose vertices are the intersection points.
+    In 2-D with *n* hyperplanes there are at most ``O(n²)`` non-empty cells
+    (arrangement complexity theorem), so BFS is tractable even though the
+    number of possible activation patterns is ``2ⁿ``.
 
-    Returns
-    -------
-    vertex_dict : dict[str, array-like]
-        Maps vertex label 'v0', 'v1', ... to 2-D coordinates.
-    edge_list : list of (str, str) tuples
-        Edges between vertex labels.
+    The algorithm:
+      1. Seed: evaluate the activation pattern at the domain centre.
+      2. For each queued pattern, build its halfspace system and compute the
+         cell vertices via ``scipy.spatial.HalfspaceIntersection``.
+      3. Determine which ReLU hyperplanes are *tight* (touch a vertex of the
+         cell).  Each tight hyperplane has an adjacent cell on the other side
+         — flip that bit to get the neighbor's activation pattern.
+      4. BFS until no unvisited neighbors remain.
+
+    Some cells leverage ``ConvexHull`` to check for degenerate intersections;
+    however, downstream methods only use vertices so ``list[np.ndarray]``
+    is the more appropriate return type.
     """
-    vertex_dict = {
-        f"v{i}": intersection_points[i] for i in range(len(intersection_points))
-    }
-    edge_list = []
+    # Seed the BFS from the domain centre
+    center = np.array([(x1_min + x1_max) / 2, (x2_min + x2_max) / 2])
+    sigma_0 = compute_activation_pattern(W_matrix, B_vector, center)
 
-    # Collect points on each rectangle edge for boundary connectivity
-    left_pts, right_pts, bottom_pts, top_pts = [], [], [], []
-    for i, pt in enumerate(intersection_points):
-        x1, x2 = pt[0], pt[1]
-        label = (f"v{i}", pt)
-        if abs(x1 - x1_min) < tol:
-            left_pts.append(label)
-        if abs(x1 - x1_max) < tol:
-            right_pts.append(label)
-        if abs(x2 - x2_min) < tol:
-            bottom_pts.append(label)
-        if abs(x2 - x2_max) < tol:
-            top_pts.append(label)
+    visited: set[ActivationPattern] = {sigma_0}
+    queue: deque[tuple[ActivationPattern, np.ndarray]] = deque([(sigma_0, center)])
+    cells: list[np.ndarray] = []
 
-    edge_list = _connect_consecutive_on_edge(left_pts, "left", edge_list)
-    edge_list = _connect_consecutive_on_edge(right_pts, "right", edge_list)
-    edge_list = _connect_consecutive_on_edge(bottom_pts, "bottom", edge_list)
-    edge_list = _connect_consecutive_on_edge(top_pts, "top", edge_list)
+    while queue:
+        sigma, hint = queue.popleft()
 
-    # Connect points that lie on the same ReLU hyperplane
-    for plane_idx in range(W_matrix.shape[1]):
-        w_i = W_matrix[:, plane_idx]
-        b_i = B_vector[plane_idx]
+        # Build the halfspace system: n ReLU constraints + 4 bounding-box
+        # walls.  Each row is [a1, a2, b] meaning a·x + b ≤ 0.
+        hs = build_cell_halfspaces(W_matrix, B_vector, bbox_hs, sigma)
 
-        on_plane = [
-            (i, pt)
-            for i, pt in enumerate(intersection_points)
-            if abs(np.dot(pt, w_i) + b_i) < tol
-        ]
-
-        # Sort along the plane: if the normal is more horizontal, sort by x2
-        if abs(w_i[0]) > abs(w_i[1]):
-            on_plane.sort(key=lambda p: p[1][1])
+        # --- Find a strictly interior point (required by HalfspaceIntersection) ---
+        # Fast path: the hint (reflected interior of the parent cell) is often
+        # already strictly feasible, saving an LP solve.
+        hint_violations = hs[:, :2] @ hint + hs[:, 2]
+        if np.all(hint_violations < -1e-10):
+            interior = hint
         else:
-            on_plane.sort(key=lambda p: p[1][0])
+            # Slow path: solve the Chebyshev-center LP for the largest
+            # inscribed ball.  Returns None when the cell is infeasible
+            # (activation pattern has no realizable region in the domain).
+            interior = find_chebyshev_center(hs)
+            if interior is None:
+                continue
 
-        for k in range(len(on_plane) - 1):
-            edge_list.append((f"v{on_plane[k][0]}", f"v{on_plane[k + 1][0]}"))
+        # --- Compute cell vertices ---
+        try:
+            hs_obj = HalfspaceIntersection(hs, interior)
+        except Exception:
+            continue  # degenerate (e.g. numerically flat cell)
 
-    return vertex_dict, edge_list
+        raw_verts = hs_obj.intersections
 
+        # HalfspaceIntersection can return duplicate or near-collinear points.
+        # ConvexHull filters these and gives vertices in CCW order.
+        if len(raw_verts) < 3:
+            continue
+        try:
+            hull = ConvexHull(raw_verts)
+        except Exception:
+            continue  # degenerate (collinear points, etc.)
+        ordered_verts = raw_verts[hull.vertices]
 
-# ── Graph / polygon extraction ─────────────────────────────────────────────────
+        if len(ordered_verts) < 3:
+            continue
 
+        cells.append(ordered_verts)
 
-def ordered_nodes_from_cycle_edges(g_ig, cycle_edge_indices):
-    """Convert a cycle (given as igraph edge indices) to an ordered node list."""
-    cycle_edges = []
-    for idx in cycle_edge_indices:
-        e = g_ig.es[idx]
-        u = g_ig.vs[e.source]["_nx_name"]
-        v = g_ig.vs[e.target]["_nx_name"]
-        cycle_edges.append((u, v))
+        # --- Discover neighboring cells ---
+        # A ReLU hyperplane is "tight" if at least one vertex of this cell
+        # lies on it (|w_i · v + b_i| < tol).  Flipping that neuron's
+        # activation bit gives the adjacent cell on the other side.
+        # Vectorized: evaluate all n hyperplanes at all k vertices at once.
+        all_values = ordered_verts @ W_matrix + B_vector  # (k, n_hidden)
+        tight_mask = np.any(np.abs(all_values) < 1e-6, axis=0)  # (n_hidden,)
 
-    adjacency = {}
-    for u, v in cycle_edges:
-        adjacency.setdefault(u, []).append(v)
-        adjacency.setdefault(v, []).append(u)
+        for i in np.where(tight_mask)[0]:
+            # Flip bit i to get the neighbor's activation pattern
+            neighbor = list(sigma)
+            neighbor[i] = not neighbor[i]
+            neighbor_pat = tuple(neighbor)
+            if neighbor_pat not in visited:
+                visited.add(neighbor_pat)
+                # Reflect interior across hyperplane i as a hint for the
+                # neighbor's interior point, avoiding an LP solve if it
+                # lands strictly inside the neighbor cell.
+                w = W_matrix[:, i]
+                b = B_vector[i]
+                dist = (w @ interior + b) / (w @ w)
+                neighbor_hint = interior - 2 * dist * w
+                queue.append((neighbor_pat, neighbor_hint))
 
-    if len(adjacency) < 3:
-        return []
-
-    start = next(iter(adjacency))
-    ordered = [start]
-    prev, current = None, start
-
-    while True:
-        neighbors = adjacency[current]
-        candidates = [n for n in neighbors if n != prev]
-        if not candidates:
-            break
-        next_node = candidates[0]
-        if next_node == start:
-            break
-        ordered.append(next_node)
-        prev, current = current, next_node
-        if len(ordered) > len(adjacency):  # safety guard
-            break
-
-    if len(set(ordered)) != len(adjacency):
-        return list(adjacency.keys())
-    return ordered
-
-
-def polygons_from_igraph_mcb(g_ig):
-    """Extract all polygon faces from the planar graph via minimum cycle basis."""
-    mcb_edges = g_ig.minimum_cycle_basis()
-    polygons = []
-    for cycle_edge_indices in mcb_edges:
-        ordered = ordered_nodes_from_cycle_edges(g_ig, cycle_edge_indices)
-        if len(ordered) >= 3:
-            polygons.append(ordered)
-    return polygons
+    return cells
 
 
 # ── Neural network utilities ───────────────────────────────────────────────────
 
 
-def _step(x):
+def _step(x: float) -> int:
     """Heaviside step function."""
     return 1 if x >= 0 else 0
 
@@ -289,18 +260,16 @@ def extract_weights(model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return W_matrix, B_vector, W_out_vec
 
 
-def analytic_gradient(W_matrix, B_vector, W_out_vec, x_state):
-    """Compute the exact gradient of the ReLU network at x_state.
+def analytic_gradient(
+    W_matrix: np.ndarray,
+    B_vector: np.ndarray,
+    W_out_vec: np.ndarray,
+    x_state: np.ndarray,
+) -> np.ndarray:
+    """Compute the exact gradient of the ReLU network at *x_state*.
 
     Exploits the fact that activation patterns are constant within each
     linear region, so the gradient is a fixed vector there.
-
-    Parameters
-    ----------
-    W_matrix : ndarray, shape (input_dim, hidden_dim)
-    B_vector : ndarray, shape (hidden_dim,)
-    W_out_vec : ndarray, shape (hidden_dim,)
-    x_state : array-like, shape (input_dim, 1)
     """
     W_out_mat = np.diag(W_out_vec)
     input_num = W_matrix.shape[0]
@@ -325,7 +294,7 @@ def analytic_gradient(W_matrix, B_vector, W_out_vec, x_state):
     return grad
 
 
-def _dynamics_numpy(dynamics: nn.Module, x: np.ndarray):
+def _dynamics_numpy(dynamics: nn.Module, x: np.ndarray) -> tuple[float, float]:
     """Evaluate dynamics at a (2, 1) numpy column vector; returns (f1, f2) floats."""
     t = torch.tensor([[x[0, 0], x[1, 0]]], dtype=torch.float32)
     out = dynamics(t)
@@ -333,7 +302,12 @@ def _dynamics_numpy(dynamics: nn.Module, x: np.ndarray):
 
 
 def verify_point(
-    W_matrix, B_vector, W_out_vec, x1_val, x2_val, dynamics: nn.Module
+    W_matrix: np.ndarray,
+    B_vector: np.ndarray,
+    W_out_vec: np.ndarray,
+    x1_val: float,
+    x2_val: float,
+    dynamics: nn.Module,
 ) -> bool:
     """Return True if the Lie derivative V_dot < 0 at (x1_val, x2_val)."""
     x = np.array([[x1_val], [x2_val]])
@@ -345,7 +319,9 @@ def verify_point(
 # ── Polygon geometry helpers ───────────────────────────────────────────────────
 
 
-def is_point_in_polygon(x, y, polygon_vertices):
+def is_point_in_polygon(
+    x: float, y: float, polygon_vertices: Sequence[Vertex2D]
+) -> bool:
     """Ray-casting test: True if (x, y) is strictly inside the polygon."""
     intersections = 0
     n = len(polygon_vertices)
@@ -361,7 +337,9 @@ def is_point_in_polygon(x, y, polygon_vertices):
     return (intersections % 2) == 1
 
 
-def zero_level_set_crosses_edge(v1, v2, f_function) -> bool:
+def zero_level_set_crosses_edge(
+    v1: Vertex2D, v2: Vertex2D, f_function: Callable[[np.ndarray], float]
+) -> bool:
     """Return True if the zero level set of f_function crosses the edge v1→v2."""
     x1_min_e = min(v1[0], v2[0])
     x1_max_e = max(v1[0], v2[0])
@@ -398,139 +376,6 @@ def zero_level_set_crosses_edge(v1, v2, f_function) -> bool:
     return False
 
 
-def amsden_hirt_grid(
-    polygon_vertices: list[float],
-    N1: int,
-    N2: int,
-    max_iter: int = 250,
-    tol: float = 1e-6,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Generate a boundary-fitted interior grid for a polygon via SOR (Amsden-Hirt).
-
-    Maps the polygon boundary onto the perimeter of an (N1 x N2) structured grid,
-    distributing points proportionally to edge length, then relaxes the interior
-    to a smooth (harmonic) mapping using successive over-relaxation (SOR).
-
-    Parameters
-    ----------
-    polygon_vertices : list of (float, float)
-        Ordered polygon vertices (open — the closing vertex is NOT repeated).
-        This list is not modified.
-    N1, N2 : int
-        Grid dimensions. Total boundary slots = 2*N1 + 2*N2 - 4.
-    max_iter : int
-        Maximum SOR iterations.
-    tol : float
-        Convergence threshold on the maximum point displacement per iteration.
-
-    Returns
-    -------
-    X, Y : ndarray, shape (N1, N2)
-        Physical coordinates of grid nodes.
-    """
-    # Close the polygon without mutating the caller's list.
-    verts = list(polygon_vertices) + [polygon_vertices[0]]
-    n_edges = len(verts) - 1
-
-    # Optimal SOR relaxation factor for a Laplace problem on a rectangular grid.
-    # Formula: ω = 4 / (2 + √(4 - (cos(π/N1) + cos(π/N2))²))
-    omega = 4 / (2 + np.sqrt(4 - (np.cos(np.pi / N1) + np.cos(np.pi / N2)) ** 2))
-
-    # Number of boundary slots on the structured grid perimeter.
-    total_pts = 2 * N1 + 2 * N2 - 4
-
-    # ── Boundary point distribution ────────────────────────────────────────────
-    # Allocate boundary slots proportionally to each polygon edge's arc length.
-    lengths = [
-        np.linalg.norm(np.array(verts[i + 1]) - np.array(verts[i]))
-        for i in range(n_edges)
-    ]
-    perimeter = sum(lengths)
-
-    # Assign integer slot counts to each edge via floor.  Do NOT clamp to 1 —
-    # short edges legitimately get 0 slots, and clamping inflates the total
-    # above total_pts before the remainder correction, causing a mismatch.
-    # The remainder (always in [-n_edges+1, n_edges-1]) goes to the last edge.
-    n_per_edge = [int((edge_len / perimeter) * total_pts) for edge_len in lengths]
-    remainder = total_pts - sum(n_per_edge)
-    n_per_edge[-1] += remainder  # guaranteed non-negative after pure floor
-
-    boundary_pts = []
-    for i in range(n_edges):
-        n = n_per_edge[i]
-        if n <= 0:
-            continue
-        p0 = np.array(verts[i])
-        p1 = np.array(verts[i + 1])
-        xs = np.linspace(p0[0], p1[0], n, endpoint=False)
-        ys = np.linspace(p0[1], p1[1], n, endpoint=False)
-        boundary_pts.extend(zip(xs.tolist(), ys.tolist()))
-
-    if len(boundary_pts) != total_pts:
-        raise ValueError(
-            f"Boundary point count mismatch: expected {total_pts}, got {len(boundary_pts)}"
-        )
-
-    # ── Assign boundary points to the structured grid perimeter ───────────────
-    # Walk the perimeter counter-clockwise:
-    #   bottom row  (j=0):      i = 0 … N1-1          (N1 pts)
-    #   right column (i=N1-1):  j = 1 … N2-2          (N2-2 pts)
-    #   top row     (j=N2-1):   i = N1-1 … 0          (N1 pts)
-    #   left column  (i=0):     j = N2-2 … 1          (N2-2 pts)
-    X = np.zeros((N1, N2), dtype=float)
-    Y = np.zeros((N1, N2), dtype=float)
-    k = 0
-    for row in range(N1):  # bottom (j=0)
-        X[row, 0], Y[row, 0] = boundary_pts[k]
-        k += 1
-    for col in range(1, N2 - 1):  # right (i=N1-1)
-        X[N1 - 1, col], Y[N1 - 1, col] = boundary_pts[k]
-        k += 1
-    for row in range(N1 - 1, -1, -1):  # top (j=N2-1)
-        X[row, N2 - 1], Y[row, N2 - 1] = boundary_pts[k]
-        k += 1
-    for col in range(N2 - 2, 0, -1):  # left (i=0)
-        X[0, col], Y[0, col] = boundary_pts[k]
-        k += 1
-
-    # ── Initial interior guess ─────────────────────────────────────────────────
-    # Bilinear interpolation between the left (i=0) and right (i=N2-1) columns.
-    # This gives the SOR a reasonable starting point.
-    for col in range(1, N2 - 1):
-        for row in range(1, N1 - 1):
-            s = row / (N1 - 1)
-            X[row, col] = (1 - s) * X[0, col] + s * X[N1 - 1, col]
-            Y[row, col] = (1 - s) * Y[0, col] + s * Y[N1 - 1, col]
-
-    # ── SOR relaxation (Gauss-Seidel sweep with over-relaxation) ──────────────
-    # Each interior node is updated to the average of its four cardinal
-    # neighbours (discretised Laplace equation ∇²X = 0, ∇²Y = 0), scaled
-    # by the over-relaxation factor ω.  Because we write back to X/Y in
-    # place, already-updated neighbors feed into later updates in the same
-    # sweep — this is Gauss-Seidel order, which is what SOR requires.
-    for _ in range(max_iter):
-        max_diff = 0.0
-        for row in range(1, N1 - 1):
-            for col in range(1, N2 - 1):
-                x_gs = np.mean(
-                    [X[row + 1, col], X[row - 1, col], X[row, col + 1], X[row, col - 1]]
-                )
-                y_gs = np.mean(
-                    [Y[row + 1, col], Y[row - 1, col], Y[row, col + 1], Y[row, col - 1]]
-                )
-                x_new = omega * x_gs + (1 - omega) * X[row, col]
-                y_new = omega * y_gs + (1 - omega) * Y[row, col]
-                diff = max(abs(x_new - X[row, col]), abs(y_new - Y[row, col]))
-                if diff > max_diff:
-                    max_diff = diff
-                X[row, col] = x_new
-                Y[row, col] = y_new
-        if max_diff < tol:
-            break
-
-    return X, Y
-
-
 # ── Polygon class ──────────────────────────────────────────────────────────────
 
 
@@ -539,23 +384,20 @@ class Polygon:
 
     Parameters
     ----------
-    vertex_names : list[str]
-        Ordered vertex labels (e.g. ['v0', 'v3', 'v7']).
-    vertex_dict : dict[str, array-like]
-        Mapping from label to 2-D coordinate.
+    vertex_coords : list of array-like
+        Ordered 2-D coordinates of the polygon vertices.
     """
 
-    def __init__(self, vertex_names, vertex_dict):
-        self.vertex_names = vertex_names
-        self.vertex_coords = [vertex_dict[v] for v in vertex_names]
+    def __init__(self, vertex_coords: Sequence[Vertex2D]) -> None:
+        self.vertex_coords = [np.asarray(c, dtype=float) for c in vertex_coords]
 
     @property
-    def centroid(self):
+    def centroid(self) -> tuple[float, float]:
         xs = [c[0] for c in self.vertex_coords]
         ys = [c[1] for c in self.vertex_coords]
         return (sum(xs) / len(xs), sum(ys) / len(ys))
 
-    def rotate(self, gradient_vec):
+    def rotate(self, gradient_vec: np.ndarray) -> tuple[float, np.ndarray]:
         """Compute the rotation that aligns gradient_vec with E_1 = [1, 0]^T.
 
         Parameters
@@ -589,7 +431,7 @@ class Polygon:
         W_out_vec: np.ndarray,
         dynamics: nn.Module,
         max_refinements: int | None = None,
-    ):
+    ) -> list[Counterexample]:
         """Detect a polygon counterexample using rf1 sign-region logic.
 
         Rules:
@@ -692,15 +534,15 @@ class Polygon:
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
 
-def _check_poly_worker(args):
-    node_list, vertex_dict, W_matrix, B_vector, W_out_vec, dynamics = args
-    poly = Polygon(node_list, vertex_dict)
+def _check_poly_worker(args: tuple) -> list[Counterexample]:
+    vertex_coords, W_matrix, B_vector, W_out_vec, dynamics = args
+    poly = Polygon(vertex_coords)
     return poly.check_gradient(W_matrix, B_vector, W_out_vec, dynamics)
 
 
 def full_method(
     problem: LyapunovProblem,
-) -> tuple[list[tuple[float, float, float]], list[str], dict[str, np.ndarray]]:
+) -> tuple[list[tuple[float, float, float]], list[list[np.ndarray]], None]:
     """End-to-end hyperplane verification pipeline.
 
     Parameters
@@ -715,94 +557,29 @@ def full_method(
     Returns
     -------
     counterexamples : list of (float, float, float)  — (x1, x2, V_dot)
-    polygons : list of list[str]   (ordered vertex-name lists)
-    vertex_dict : dict[str, array-like]
+    cells : list of list[ndarray]  — ordered vertex coordinates per cell
     """
     x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
     x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
 
     W_matrix, B_vector, W_out_vec = extract_weights(problem.nn_lyapunov)
 
-    print("Getting intersection points...")
-    t0 = time.perf_counter()
-    intersection_points = find_all_intersection_points(
-        W_matrix,
-        B_vector,
-        x1_min,
-        x1_max,
-        x2_min,
-        x2_max,
-    )
-    print(
-        f"  done ({time.perf_counter() - t0:.3f}s)  — {len(intersection_points)} points"
-    )
+    bbox_hs = build_bbox_halfspaces(x1_min, x1_max, x2_min, x2_max)
 
-    print("Building planar graph...")
+    print("Enumerating cells via BFS...")
     t0 = time.perf_counter()
-    vertex_dict, edge_list = get_planar_graph(
-        intersection_points,
-        W_matrix,
-        B_vector,
-        x1_min,
-        x1_max,
-        x2_min,
-        x2_max,
+    cells = enumerate_cells_bfs(
+        W_matrix, B_vector, bbox_hs, x1_min, x1_max, x2_min, x2_max
     )
-    G = nx.Graph()
-    G.add_nodes_from(vertex_dict.keys())
-    G.add_edges_from(edge_list)
-    print(f"  done ({time.perf_counter() - t0:.3f}s)")
-
-    print("Finding polygons...")
-    t0 = time.perf_counter()
-    g_ig = ig.Graph.from_networkx(G)
-    polygon_node_lists = polygons_from_igraph_mcb(g_ig)
-    print(
-        f"  done ({time.perf_counter() - t0:.3f}s)  "
-        f"— {len(polygon_node_lists)} polygons"
-    )
-
-    # Filter out near-zero-area polygons before verification.
-    # These arise from residual near-duplicate vertices after dedup and from
-    # boundary-edge slivers; their centroids land in degenerate regions that
-    # produce false-positive counterexamples.
-    domain_area = (x1_max - x1_min) * (x2_max - x2_min)
-    area_tol = domain_area * 1e-10  # absolute area threshold
-    filtered_node_lists = []
-    n_zero_area = 0
-    for node_list in polygon_node_lists:
-        coords = [np.asarray(vertex_dict[v], dtype=float) for v in node_list]
-        if len(coords) < 3:
-            n_zero_area += 1
-            continue
-        xs = [c[0] for c in coords]
-        ys = [c[1] for c in coords]
-        n = len(xs)
-        area = (
-            abs(
-                sum(xs[i] * ys[(i + 1) % n] - xs[(i + 1) % n] * ys[i] for i in range(n))
-            )
-            / 2.0
-        )
-        if area < area_tol:
-            n_zero_area += 1
-        else:
-            filtered_node_lists.append(node_list)
-    if n_zero_area:
-        print(
-            f"  Filtered {n_zero_area} near-zero-area polygons "
-            f"({len(filtered_node_lists)} remain)"
-        )
+    print(f"  done ({time.perf_counter() - t0:.3f}s)  — {len(cells)} cells")
 
     print("Running verification...")
     t0 = time.perf_counter()
     dynamics_cpu = problem.dynamics.cpu()
     work_items = [
-        (node_list, vertex_dict, W_matrix, B_vector, W_out_vec, dynamics_cpu)
-        for node_list in filtered_node_lists
+        (cell.tolist(), W_matrix, B_vector, W_out_vec, dynamics_cpu) for cell in cells
     ]
     with Pool() as pool:
-        print(f"Using {pool._processes} parallel workers...")
         results = pool.map(_check_poly_worker, work_items)
     counterexamples = [cex for batch in results for cex in batch]
     print(
@@ -810,4 +587,5 @@ def full_method(
         f"— {len(counterexamples)} counterexamples"
     )
 
-    return counterexamples, polygon_node_lists, vertex_dict
+    cell_coords = [cell.tolist() for cell in cells]
+    return counterexamples, cell_coords, None
