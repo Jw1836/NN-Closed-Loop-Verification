@@ -10,13 +10,13 @@ Dynamics:
 - Global Lyapunov function: V = ||x||^2
 
 Usage:
-    python -m verify_relu_lyapunov problems/bilinear_oscillator.py
+    python -m relu_vnn problems/bilinear_oscillator.py
 """
 
 import torch
 from torch import nn, Tensor
 
-from verify_relu_lyapunov import LyapunovProblem
+from relu_vnn import LyapunovProblem
 
 
 class BilinearDynamics(nn.Module):

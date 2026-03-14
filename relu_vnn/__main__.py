@@ -1,14 +1,14 @@
 """CEGIS loop for ReLU Lyapunov verification.
 
 Usage:
-    python -m verify_relu_lyapunov <problem_file.py> [options]
+    python -m relu_vnn <problem_file.py> [options]
 
 The problem file must define a `make_problem()` function that returns a
 LyapunovProblem instance.
 
 Example:
-    python -m verify_relu_lyapunov problems/pendulum.py --hidden-size 30
-    python -m verify_relu_lyapunov problems/duffing_oscillator.py --epochs 800
+    python -m relu_vnn problems/pendulum.py --hidden-size 30
+    python -m relu_vnn problems/duffing_oscillator.py --epochs 800
 """
 
 import argparse

@@ -21,7 +21,7 @@ Equilibrium points:
     x_e2 = [\pi 0]' and is unstable
 
 Usage:
-    python -m verify_relu_lyapunov problems/pendulum.py
+    python -m relu_vnn problems/pendulum.py
 """
 
 from typing import Any
@@ -29,7 +29,7 @@ from typing import Any
 import torch
 from torch import nn, Tensor
 
-from verify_relu_lyapunov import LyapunovProblem
+from relu_vnn import LyapunovProblem
 
 
 class PendulumDynamics(nn.Module):
