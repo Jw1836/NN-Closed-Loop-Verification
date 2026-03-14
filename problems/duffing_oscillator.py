@@ -9,13 +9,13 @@ Dynamics:
 Default parameters: delta = alpha = beta = 1.
 
 Usage:
-    python -m verify_relu_lyapunov problems/duffing_oscillator.py
+    python -m relu_vnn problems/duffing_oscillator.py
 """
 
 import torch
 from torch import nn, Tensor
 
-from verify_relu_lyapunov import LyapunovProblem
+from relu_vnn import LyapunovProblem
 
 # Default Duffing parameters
 DELTA: float = 1.0
