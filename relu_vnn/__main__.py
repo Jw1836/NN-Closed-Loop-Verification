@@ -107,7 +107,6 @@ def plot_verification(
     problem: LyapunovProblem,
     counterexamples,
     polygons,
-    vertex_dict,
     grid_pts: int,
     title: str,
 ):
@@ -125,8 +124,7 @@ def plot_verification(
         V = problem.nn_lyapunov(plot_pts).numpy().reshape(x1g.shape)
     ax.contourf(x1g, x2g, V, levels=20, cmap="viridis", alpha=0.5)
     ax.contour(x1g, x2g, V, levels=20, colors="white", linewidths=0.4, alpha=0.3)
-    for poly_nodes in polygons:
-        coords = [vertex_dict[v] for v in poly_nodes]
+    for coords in polygons:
         xs = [c[0] for c in coords] + [coords[0][0]]
         ys = [c[1] for c in coords] + [coords[0][1]]
         ax.plot(xs, ys, "k-", linewidth=0.6, alpha=0.5)
@@ -303,7 +301,7 @@ def main():
 
     # ── Initial verification ──────────────────────────────────────────────────
     problem.to("cpu")
-    counterexamples_raw, polygons, vertex_dict = full_method(problem)
+    counterexamples_raw, polygons, _ = full_method(problem)
     counterexamples = [
         p for p in counterexamples_raw if (p[0] ** 2 + p[1] ** 2) >= args.epsilon**2
     ]
@@ -317,7 +315,6 @@ def main():
         problem,
         counterexamples,
         polygons,
-        vertex_dict,
         args.grid_pts,
         "Hyperplane verification: polygon tessellation + counterexamples",
     )
@@ -414,7 +411,7 @@ def main():
 
     # ── Final verification ────────────────────────────────────────────────────
     problem.to("cpu")
-    final_cexs_raw, final_polygons, final_vertex_dict = full_method(problem)
+    final_cexs_raw, final_polygons, _ = full_method(problem)
     final_cexs = [
         p for p in final_cexs_raw if (p[0] ** 2 + p[1] ** 2) >= args.epsilon**2
     ]
@@ -428,7 +425,6 @@ def main():
         problem,
         final_cexs,
         final_polygons,
-        final_vertex_dict,
         args.grid_pts,
         "Final verification: polygon tessellation + counterexamples",
     )
