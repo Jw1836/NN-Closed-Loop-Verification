@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from scipy.optimize import linprog
 from scipy.spatial import ConvexHull, HalfspaceIntersection, QhullError
-from typing import Callable, Sequence, cast
+from typing import Sequence, cast
 from torch import nn
 
 # Type aliases
@@ -319,216 +319,56 @@ def verify_point(
     return float(grad[0] * f1 + grad[1] * f2) < 0
 
 
-# ── Polygon geometry helpers ───────────────────────────────────────────────────
+# ── ConvexHull functions ───────────────────────────────────────────────────────
 
 
-def is_point_in_polygon(
-    x: float, y: float, polygon_vertices: Sequence[Vertex2D]
-) -> bool:
-    """Ray-casting test: True if (x, y) is strictly inside the polygon."""
-    intersections = 0
-    n = len(polygon_vertices)
-    for i in range(n):
-        xi, yi = polygon_vertices[i]
-        xj, yj = polygon_vertices[(i + 1) % n]
-        if (yi > y) != (yj > y):
-            xinters = xi + (y - yi) * (xj - xi) / (yj - yi)
-            if abs(xinters - x) < 1e-12:
-                return False
-            if xinters > x:
-                intersections += 1
-    return (intersections % 2) == 1
+def align_basis(
+    cell: ConvexHull,
+    gradient: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rotate cell vertices so that *gradient* aligns with E_1, matrix-free.
 
-
-def zero_level_set_crosses_edge(
-    v1: Vertex2D, v2: Vertex2D, f_function: Callable[[np.ndarray], float]
-) -> bool:
-    """Return True if the zero level set of f_function crosses the edge v1→v2."""
-    x1_min_e = min(v1[0], v2[0])
-    x1_max_e = max(v1[0], v2[0])
-    x2_min_e = min(v1[1], v2[1])
-    x2_max_e = max(v1[1], v2[1])
-
-    # Quick check on endpoints
-    f_v1 = f_function(np.array([[v1[0]], [v1[1]]]))
-    f_v2 = f_function(np.array([[v2[0]], [v2[1]]]))
-    if f_v1 * f_v2 < 0:
-        return True
-
-    # Refine along the edge (lightweight sampling + early exit)
-    x1_diff = x1_max_e - x1_min_e
-    x2_diff = x2_max_e - x2_min_e
-    steps = max(int(max(x1_diff, x2_diff) * 8), 64)
-
-    if abs(v2[0] - v1[0]) < 1e-10:  # vertical edge
-        x1_on_edge = np.full(steps, v1[0])
-        x2_on_edge = np.linspace(x2_min_e, x2_max_e, steps)
-    else:
-        t = np.linspace(0, 1, steps)
-        x1_on_edge = v1[0] + t * (v2[0] - v1[0])
-        x2_on_edge = v1[1] + t * (v2[1] - v1[1])
-
-    prev = float(f_function(np.array([[x1_on_edge[0]], [x2_on_edge[0]]])))
-    prev_sign = np.sign(prev)
-    for x1, x2 in zip(x1_on_edge[1:], x2_on_edge[1:]):
-        cur = float(f_function(np.array([[x1], [x2]])))
-        cur_sign = np.sign(cur)
-        if prev_sign * cur_sign < 0:
-            return True
-        prev_sign = cur_sign
-    return False
-
-
-# ── Polygon class ──────────────────────────────────────────────────────────────
-
-
-class Polygon:
-    """A single face of the ReLU hyperplane arrangement.
+    Uses a Householder reflection Q = I - 2 v v^T / (v^T v) with
+    v = g_hat - e_1, giving Q @ g_hat = +e_1.  The full matrix is never
+    formed; vertices are rotated via the rank-1 update and Q's first row
+    is returned as a vector for downstream rf1 computation.
 
     Parameters
     ----------
-    vertex_coords : list of array-like
-        Ordered 2-D coordinates of the polygon vertices.
+    cell : ConvexHull
+        Polytope whose vertices live in R^n.
+    gradient : ndarray, shape (n,) or (n, 1)
+        Non-zero gradient of the Lyapunov function in this cell.
+
+    Returns
+    -------
+    q1 : ndarray, shape (n,)
+        First row of Q.  ``q1 @ f`` gives the rotated first component of f.
+    rotated_vertices : ndarray, shape (num_vertices, n)
+        Cell vertices after applying Q.
     """
+    g = np.asarray(gradient, dtype=float).flatten()
+    n = g.shape[0]
+    g_hat = g / np.linalg.norm(g)
 
-    def __init__(self, vertex_coords: Sequence[Vertex2D]) -> None:
-        self.vertex_coords = [np.asarray(c, dtype=float) for c in vertex_coords]
+    e1 = np.zeros(n)
+    e1[0] = 1.0
 
-    @property
-    def centroid(self) -> tuple[float, float]:
-        xs = [c[0] for c in self.vertex_coords]
-        ys = [c[1] for c in self.vertex_coords]
-        return (sum(xs) / len(xs), sum(ys) / len(ys))
+    v = g_hat - e1
+    vtv = np.dot(v, v)
 
-    def rotate(self, gradient_vec: np.ndarray) -> tuple[float, np.ndarray]:
-        """Compute the rotation that aligns gradient_vec with E_1 = [1, 0]^T.
+    vertices = cell.points[cell.vertices]
 
-        Parameters
-        ----------
-        gradient_vec : ndarray, shape (2, 1)
+    if vtv < 1e-14:
+        # gradient already aligned with e_1
+        return e1.copy(), vertices.copy()
 
-        Returns
-        -------
-        theta : float
-            Rotation angle (radians).
-        R : ndarray, shape (2, 2)
-            Rotation matrix.
-        """
-        grad_flat = np.asarray(gradient_vec, dtype=float).reshape(-1)
-        if grad_flat.size < 2:
-            raise ValueError(
-                f"gradient_vec must have at least 2 entries, got shape {np.asarray(gradient_vec).shape}"
-            )
-        gx, gy = float(grad_flat[0]), float(grad_flat[1])
-        theta = -np.arctan2(gy, gx)
-        R = np.array(
-            [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]],
-            dtype=float,
-        )
-        return theta, R
+    # Matrix-free rotation: Q @ x = x - 2 v (v^T x) / (v^T v)
+    # For rows of `vertices` (shape m x n): proj has shape (m,)
+    proj = (vertices @ v) / vtv
+    rotated_vertices = vertices - 2.0 * np.outer(proj, v)
 
-    def check_gradient(
-        self,
-        W_matrix: np.ndarray,
-        B_vector: np.ndarray,
-        W_out_vec: np.ndarray,
-        dynamics: nn.Module,
-        max_refinements: int | None = None,
-    ) -> list[Counterexample]:
-        """Detect a polygon counterexample using rf1 sign-region logic.
+    # First row of Q: e_1 - 2 v[0] v / (v^T v)
+    q1 = e1 - 2.0 * v[0] * v / vtv
 
-        Rules:
-        1) If rf1 intersects any polygon edge, target region count is 2; else 1.
-        2) For target=1, do not discretize: test centroid only.
-        3) For target=2, discretize polygon bounds and return the first interior,
-           non-edge point with rf1 >= 0.
-        """
-        centroid_x = float(self.centroid[0])
-        centroid_y = float(self.centroid[1])
-        x_col = np.array([[centroid_x], [centroid_y]])
-        grad = analytic_gradient(W_matrix, B_vector, W_out_vec, x_col)
-        g1, g2 = float(grad[0, 0]), float(grad[1, 0])
-
-        # ── Zero-gradient early exit ──────────────────────────────────────────
-        # If ∇V = 0 then V is constant in this polygon, so V_dot = ∇V · f = 0
-        # everywhere — V is not strictly decreasing.  The rotation framework
-        # below is undefined (no direction to align with E_1), and would
-        # fall through to checking rf1 = f1, which is unrelated to V_dot.
-        # Return the centroid as a counterexample immediately.
-        if np.linalg.norm(grad) < 1e-10:
-            return [(float(self.centroid[0]), float(self.centroid[1]), 0.0)]
-
-        theta = -np.arctan2(g2, g1)
-        cos_t = float(np.cos(theta))
-        sin_t = float(np.sin(theta))
-
-        def rf1(x):
-            f1, f2 = _dynamics_numpy(dynamics, x)
-            return cos_t * f1 - sin_t * f2
-
-        xs_i = [float(c[0]) for c in self.vertex_coords] + [
-            float(self.vertex_coords[0][0])
-        ]
-        ys_i = [float(c[1]) for c in self.vertex_coords] + [
-            float(self.vertex_coords[0][1])
-        ]
-
-        # Step 1: edge-intersection test for rf1 determines target region count.
-        rf1_crosses_edge = False
-        for j in range(len(xs_i) - 1):
-            x1_start, x2_start = xs_i[j], ys_i[j]
-            x1_end, x2_end = xs_i[j + 1], ys_i[j + 1]
-            if zero_level_set_crosses_edge((x1_start, x2_start), (x1_end, x2_end), rf1):
-                rf1_crosses_edge = True
-                break
-        num_regions = 2 if rf1_crosses_edge else 1
-
-        # Step 2: one-region case -> centroid-only classification.
-        if num_regions == 1:
-            x_c = np.array([[centroid_x], [centroid_y]])
-            centroid_val = float(rf1(x_c))
-            if centroid_val >= 0.0:
-                f1_c, f2_c = _dynamics_numpy(dynamics, x_c)
-                vdot = g1 * float(f1_c) + g2 * float(f2_c)
-                return [(centroid_x, centroid_y, vdot)]
-            return []
-
-        # Step 3: two-region case -> discretize bounds and stop at first CEX.
-        del max_refinements  # intentionally unused in discretized variant
-
-        def _is_on_edge(px: float, py: float, tol: float = 1e-10) -> bool:
-            for j in range(len(xs_i) - 1):
-                x1_start, y1_start = xs_i[j], ys_i[j]
-                x1_end, y1_end = xs_i[j + 1], ys_i[j + 1]
-                dx = x1_end - x1_start
-                dy = y1_end - y1_start
-                seg_len_sq = dx * dx + dy * dy
-                if seg_len_sq <= tol:
-                    continue
-                t = ((px - x1_start) * dx + (py - y1_start) * dy) / seg_len_sq
-                if t < -tol or t > 1.0 + tol:
-                    continue
-                proj_x = x1_start + t * dx
-                proj_y = y1_start + t * dy
-                dist_sq = (px - proj_x) ** 2 + (py - proj_y) ** 2
-                if dist_sq <= tol * tol:
-                    return True
-            return False
-
-        x1_poly = np.linspace(min(xs_i), max(xs_i), 100)
-        x2_poly = np.linspace(min(ys_i), max(ys_i), 100)
-        for x1 in x1_poly:
-            for x2 in x2_poly:
-                x1f = float(x1)
-                x2f = float(x2)
-                if _is_on_edge(x1f, x2f):
-                    continue
-                if not is_point_in_polygon(x1f, x2f, self.vertex_coords):
-                    continue
-                x_point = np.array([[x1f], [x2f]])
-                if float(rf1(x_point)) >= 0.0:
-                    f1_p, f2_p = _dynamics_numpy(dynamics, x_point)
-                    vdot_p = g1 * float(f1_p) + g2 * float(f2_p)
-                    return [(x1f, x2f, vdot_p)]
-
-        return []
+    return q1, rotated_vertices

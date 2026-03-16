@@ -87,14 +87,36 @@ class LyapunovProblem:
 
         return cex
 
-    def check_decrease(self, H: list[ConvexHull]) -> np.ndarray | None:
+    def check_decrease(self, cells: list[ConvexHull]) -> np.ndarray | None:
         """Check that ∇V(x)·f(x) < 0 everywhere except the origin (third Lyapunov condition).
 
         Returns None if the condition holds, or a 2-D array with each row
         [x1, x2, V_dot] indicating a violation.
         """
-        # TODO
-        return None
+        from .hyperplane import align_basis, analytic_gradient, extract_weights
+
+        W_matrix, B_vector, W_out_vec = extract_weights(self.nn_lyapunov)
+        violations: list[np.ndarray] = []
+
+        for c in cells:
+            # Calculate cell's gradient at the centroid
+            centroid = c.points[c.vertices].mean(axis=0)
+            grad = analytic_gradient(W_matrix, B_vector, W_out_vec, centroid)
+
+            # If gradient is zero, V_dot = 0 everywhere in cell, means counterexample
+            if np.linalg.norm(grad) < 1e-10:
+                violations.append(np.append(centroid, 0.0))
+                continue
+
+            # Align polytope with the basis vector
+            q1, qV = align_basis(c, grad)
+
+            # In the rotated frame, V_dot = ||grad|| * q1 @ f(x),
+            # so V_dot >= 0 iff q1 @ f(x) >= 0.
+            # The hard part is that f(x) is nonlinear
+            # TODO: max solver
+
+        return None if not violations else np.vstack(violations)
 
     def enumerate_cells(self) -> list[ConvexHull]:
         """Build the ReLU activation-pattern cell decomposition for this network and region."""
