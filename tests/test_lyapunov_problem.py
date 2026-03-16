@@ -60,18 +60,18 @@ class TestCheckOrigin:
         prob = _make_problem(ConstantNet(1.0))
         result = prob.check_origin()
         assert result is not None
-        # Shape: (state_dim + 1,) = (3,) for 2-D problem
-        assert result.shape == (prob.state_dim + 1,)
+        # Shape: (1, state_dim + 1) = (1, 3) for 2-D problem
+        assert result.shape == (1, prob.state_dim + 1)
         # First state_dim entries are the origin
-        assert np.allclose(result[:-1], 0.0)
+        assert np.allclose(result[0, :-1], 0.0)
         # Last entry is V(0)
-        assert np.isclose(result[-1], 1.0)
+        assert np.isclose(result[0, -1], 1.0)
 
     def test_negative_v0_is_also_a_violation(self):
         prob = _make_problem(ConstantNet(-0.5))
         result = prob.check_origin()
         assert result is not None
-        assert np.isclose(result[-1], -0.5)
+        assert np.isclose(result[0, -1], -0.5)
 
 
 # ---------------------------------------------------------------------------

@@ -54,7 +54,8 @@ class LyapunovProblem:
         v0 = float(self.nn_lyapunov(origin).item())
         if np.isclose(v0, 0.0):
             return None
-        return np.array([*([0.0] * self.state_dim), v0])
+        # Return 2-D array (1, state_dim+1) for consistency with other checks
+        return np.array([[*([0.0] * self.state_dim), v0]])
 
     def check_positive(self, H: list[ConvexHull]) -> np.ndarray | None:
         """Check that V(x) > 0 for all x in region, except the origin (second Lyapunov condition).
