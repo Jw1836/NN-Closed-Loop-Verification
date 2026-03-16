@@ -190,7 +190,6 @@ def enumerate_cells_bfs(
                 incremental=False,
             )
         except QhullError:
-            print(f"INFO: degenerate {QhullError} with {sigma}")
             continue  # degenerate (e.g. numerically flat cell)
 
         raw_verts = hs_obj.intersections
