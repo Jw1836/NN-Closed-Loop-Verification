@@ -37,18 +37,28 @@ def compute_activation_pattern(
     return tuple(bool(v >= 0) for v in pre)
 
 
-def build_bbox_halfspaces(
-    x1_min: float, x1_max: float, x2_min: float, x2_max: float
-) -> np.ndarray:
-    """Build bounding box halfspaces in the form [a1, a2, b] where a·x + b <= 0."""
-    return np.array(
-        [
-            [-1.0, 0.0, x1_min],  # x1 >= x1_min  =>  -x1 + x1_min <= 0
-            [1.0, 0.0, -x1_max],  # x1 <= x1_max  =>   x1 - x1_max <= 0
-            [0.0, -1.0, x2_min],  # x2 >= x2_min  =>  -x2 + x2_min <= 0
-            [0.0, 1.0, -x2_max],  # x2 <= x2_max  =>   x2 - x2_max <= 0
-        ]
-    )
+def build_bbox_halfspaces(region: np.ndarray) -> np.ndarray:
+    """Build bounding box halfspaces in the form [a1, ..., an, b] where a·x + b <= 0.
+
+    Parameters
+    ----------
+    region : ndarray, shape (state_dim, 2)
+        Each row is [min, max] for that dimension.
+
+    Returns
+    -------
+    ndarray, shape (2*state_dim, state_dim+1)
+    """
+    state_dim = region.shape[0]
+    hs = np.zeros((2 * state_dim, state_dim + 1))
+    for d in range(state_dim):
+        # x_d >= region[d, 0]  =>  -x_d + region[d, 0] <= 0
+        hs[2 * d, d] = -1.0
+        hs[2 * d, -1] = region[d, 0]
+        # x_d <= region[d, 1]  =>   x_d - region[d, 1] <= 0
+        hs[2 * d + 1, d] = 1.0
+        hs[2 * d + 1, -1] = -region[d, 1]
+    return hs
 
 
 def build_cell_halfspaces(
@@ -60,18 +70,20 @@ def build_cell_halfspaces(
     """Build halfspaces for a polyhedral cell with the given activation pattern.
 
     Each neuron i contributes: if active, -w_i·x - b_i <= 0; if inactive, w_i·x + b_i <= 0.
-    Combined with the 4 bounding-box halfspaces.
+    Combined with the bounding-box halfspaces.
     """
     n_hidden = W_matrix.shape[1]
-    hs = np.empty((n_hidden + 4, 3))  # each neuron + 4 bounds from original region
-    hs[:4] = bbox_hs
+    n_bbox = bbox_hs.shape[0]
+    state_dim = W_matrix.shape[0]
+    hs = np.empty((n_hidden + n_bbox, state_dim + 1))
+    hs[:n_bbox] = bbox_hs
     for i in range(n_hidden):
         w = W_matrix[:, i]
         b = B_vector[i]
         if pattern[i]:  # active: w·x + b >= 0  =>  -w·x - b <= 0
-            hs[4 + i] = [-w[0], -w[1], -b]
+            hs[n_bbox + i] = np.concatenate([-w, [-b]])
         else:  # inactive: w·x + b <= 0
-            hs[4 + i] = [w[0], w[1], b]
+            hs[n_bbox + i] = np.concatenate([w, [b]])
     return hs
 
 
@@ -79,31 +91,33 @@ def find_chebyshev_center(halfspaces: np.ndarray) -> np.ndarray | None:
     """Find a strictly interior point via the Chebyshev center LP.
 
     Maximizes the inscribed ball radius r subject to a_j·x + b_j + ||a_j||·r <= 0.
-    Each row of *halfspaces* is ``[a1, a2, b]`` defining ``a·x + b <= 0``.
-    Returns shape ``(2,)`` or ``None`` if infeasible.
+    Each row of *halfspaces* is ``[a1, ..., an, b]`` defining ``a·x + b <= 0``.
+    Returns shape ``(state_dim,)`` or ``None`` if infeasible.
 
     This is a slightly more expensive but robust way to find an interior point.
     It has the advantage of returning ``None`` for infeasible solutions,
     meaning they have effectively zero area.
     """
-    A_hs = halfspaces[:, :2]
-    b_hs = halfspaces[:, 2]
+    state_dim = halfspaces.shape[1] - 1
+    A_hs = halfspaces[:, :-1]
+    b_hs = halfspaces[:, -1]
     norms = np.linalg.norm(A_hs, axis=1, keepdims=True)
 
     # LP: minimize -r  subject to  A_hs @ x + norms * r <= -b_hs, r >= 0
     A_lp = np.hstack([A_hs, norms])
     b_lp = -b_hs
-    c = np.array([0.0, 0.0, -1.0])
+    c = np.zeros(state_dim + 1)
+    c[-1] = -1.0
 
     result = linprog(
         c,
         A_ub=A_lp,
         b_ub=b_lp,
-        bounds=[(None, None), (None, None), (0, None)],
+        bounds=[(None, None)] * state_dim + [(0, None)],
         method="highs",
     )
-    if result.success and result.x[2] > 1e-10:
-        return result.x[:2]
+    if result.success and result.x[-1] > 1e-10:
+        return result.x[:state_dim]
     return None
 
 
@@ -111,10 +125,7 @@ def enumerate_cells_bfs(
     W_matrix: np.ndarray,
     B_vector: np.ndarray,
     bbox_hs: np.ndarray,
-    x1_min: float,
-    x1_max: float,
-    x2_min: float,
-    x2_max: float,
+    region: np.ndarray,
 ) -> list[ConvexHull]:
     """Enumerate all non-empty cells of the ReLU hyperplane arrangement via BFS.
 
@@ -142,7 +153,8 @@ def enumerate_cells_bfs(
     (``hull.equations``) for point-in-cell tests.
     """
     # Seed the BFS from the domain center
-    center = np.array([(x1_min + x1_max) / 2, (x2_min + x2_max) / 2])
+    state_dim = region.shape[0]
+    center = region.mean(axis=1)
     sigma_0 = compute_activation_pattern(W_matrix, B_vector, center)
 
     visited: set[ActivationPattern] = {sigma_0}
@@ -152,14 +164,14 @@ def enumerate_cells_bfs(
     while queue:
         sigma, hint = queue.popleft()
 
-        # Build the halfspace system: n ReLU constraints + 4 bounding-box
-        # walls.  Each row is [a1, a2, b] meaning a·x + b ≤ 0.
+        # Build the halfspace system: n ReLU constraints + 2*state_dim
+        # bounding-box walls.  Each row is [a1, ..., an, b] meaning a·x + b ≤ 0.
         hs = build_cell_halfspaces(W_matrix, B_vector, bbox_hs, sigma)
 
         # --- Find a strictly interior point (required by HalfspaceIntersection) ---
         # Fast path: the hint (reflected interior of the parent cell) is often
         # already strictly feasible, saving an LP solve.
-        hint_violations = hs[:, :2] @ hint + hs[:, 2]
+        hint_violations = hs[:, :-1] @ hint + hs[:, -1]
         if np.all(hint_violations < -1e-10):
             interior = hint
         else:
@@ -177,7 +189,7 @@ def enumerate_cells_bfs(
                 interior,
                 incremental=False,
             )
-        except QhullError as e:
+        except QhullError:
             print(f"INFO: degenerate {QhullError} with {sigma}")
             continue  # degenerate (e.g. numerically flat cell)
 
@@ -185,13 +197,13 @@ def enumerate_cells_bfs(
 
         # HalfspaceIntersection can return duplicate or near-collinear points.
         # ConvexHull filters these and gives vertices in CCW order.
-        if len(raw_verts) < 3:
+        if len(raw_verts) < state_dim + 1:
             continue
         try:
             hull = ConvexHull(raw_verts, incremental=False)
         except QhullError:
             continue  # degenerate (collinear points, etc.)
-        if len(hull.vertices) < 3:
+        if len(hull.vertices) < state_dim + 1:
             continue
 
         cells.append(hull)
@@ -272,27 +284,18 @@ def analytic_gradient(
     Exploits the fact that activation patterns are constant within each
     linear region, so the gradient is a fixed vector there.
     """
-    W_out_mat = np.diag(W_out_vec)
-    input_num = W_matrix.shape[0]
     hidden_num = W_matrix.shape[1]
 
     # Flatten to 1-D so dot products always return scalars, regardless of
     # whether x_state was passed as (n,) or (n, 1).
     x_flat = np.asarray(x_state).flatten()
 
-    # Activation pattern at x_state
+    # Activation pattern at x_state: (hidden_dim,) binary vector
     U = np.array(
-        [
-            [_step(np.dot(W_matrix[:, i], x_flat) + B_vector[i])]
-            for i in range(hidden_num)
-        ]
-    )  # (hidden_dim, 1)
+        [_step(np.dot(W_matrix[:, i], x_flat) + B_vector[i]) for i in range(hidden_num)]
+    )
 
-    grad = np.zeros((input_num, 1))
-    for i in range(input_num):
-        W_prime = W_out_mat @ W_matrix[i, :].reshape(-1, 1)
-        grad[i] = (U.T @ W_prime).item()  # (1,1) → scalar
-    return grad
+    return (W_matrix @ (U * W_out_vec)).reshape(-1, 1)
 
 
 def _dynamics_numpy(dynamics: nn.Module, x: np.ndarray) -> tuple[float, float]:

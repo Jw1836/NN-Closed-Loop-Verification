@@ -47,8 +47,8 @@ class LyapunovProblem:
     def check_origin(self) -> np.ndarray | None:
         """Check that V(0) = 0 (first Lyapunov condition).
 
-        Returns None if the condition holds, or a 1-D array [x1, ..., xn, V(0)]
-        indicating the violation if the condition fails.
+        Returns None if the condition holds, or a 2-D array of shape
+        (1, state_dim+1) with row [x1, ..., xn, V(0)] if the condition fails.
         """
         origin = torch.zeros(1, self.state_dim, device=self.device)
         v0 = float(self.nn_lyapunov(origin).item())
@@ -117,17 +117,14 @@ class LyapunovProblem:
             "decrease": None,
         }
 
-        x1_min, x1_max = self.region[0, 0].item(), self.region[0, 1].item()
-        x2_min, x2_max = self.region[1, 0].item(), self.region[1, 1].item()
+        region_np = self.region.numpy()
 
         W_matrix, B_vector, _ = extract_weights(self.nn_lyapunov)
-        bbox_hs = build_bbox_halfspaces(x1_min, x1_max, x2_min, x2_max)
+        bbox_hs = build_bbox_halfspaces(region_np)
 
         print("Enumerating cells via BFS...")
         t0 = time.perf_counter()
-        cells = enumerate_cells_bfs(
-            W_matrix, B_vector, bbox_hs, x1_min, x1_max, x2_min, x2_max
-        )
+        cells = enumerate_cells_bfs(W_matrix, B_vector, bbox_hs, region_np)
         print(f"  done ({time.perf_counter() - t0:.3f}s)  — {len(cells)} cells")
 
         # Criteria 1: V(0) = 0
@@ -213,7 +210,7 @@ def lyapunov_loss_function(
     V_x = practice_nn(x_train_2d)
 
     # 1. Origin penalty
-    origin = torch.zeros((1, 2), device=x_train_2d.device)
+    origin = torch.zeros((1, x_train_2d.shape[1]), device=x_train_2d.device)
     V_0 = practice_nn(origin)
     origin_penalty = torch.pow(V_0, 2).mean()
 
@@ -277,7 +274,7 @@ def fine_tune_on_counterexamples(
 
     Args:
         problem:          LyapunovProblem whose nn_lyapunov will be updated in place.
-        counterexamples:  List of (x1, x2) points where V_dot >= 0.
+        counterexamples:  List of state-space points where V_dot >= 0.
         num_epochs:       Gradient steps on the counterexample batch.
         learning_rate:    Small LR to avoid forgetting already-correct regions.
     """
@@ -294,7 +291,7 @@ def fine_tune_on_counterexamples(
         V_x = model(x)
 
         # Origin condition — don't let it drift
-        origin = torch.zeros((1, 2), device=problem.device)
+        origin = torch.zeros((1, problem.state_dim), device=problem.device)
         origin_penalty = model(origin).pow(2).mean()
 
         # Lie derivative at counterexample points only

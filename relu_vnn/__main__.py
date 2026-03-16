@@ -60,9 +60,11 @@ def append_cex_log(cex_log_path: str, iteration: int, cexs: list[tuple]):
     with open(cex_log_path, "a", newline="") as f:
         writer = csv.writer(f)
         if write_header:
-            writer.writerow(["iteration", "x1", "x2", "dVx"])
+            # state dims + value column (last element of each cex tuple)
+            state_cols = [f"x{i + 1}" for i in range(len(cexs[0]) - 1)]
+            writer.writerow(["iteration"] + state_cols + ["dVx"])
         for p in cexs:
-            writer.writerow([iteration, p[0], p[1], p[2]])
+            writer.writerow([iteration] + list(p))
 
 
 # ── Problem loader ────────────────────────────────────────────────────────────
@@ -162,6 +164,11 @@ def plot_verification(
     grid_pts: int,
     title: str,
 ):
+    if problem.state_dim != 2:
+        print(
+            f"Plotting skipped (only supported for 2D problems, got {problem.state_dim}D)"
+        )
+        return
     x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
     x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
 
@@ -204,6 +211,8 @@ def plot_verification(
 
 
 def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem):
+    if problem.state_dim != 2:
+        return
     x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
     x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
 
@@ -370,9 +379,7 @@ def main():
 
     # ── Initial verification ──────────────────────────────────────────────────
     problem.to("cpu")
-    origin_cexs, spatial_cexs, polygons = _unpack_verify(
-        problem.verify(), args.epsilon
-    )
+    origin_cexs, spatial_cexs, polygons = _unpack_verify(problem.verify(), args.epsilon)
     all_cexs = origin_cexs + spatial_cexs
     _print_verify_summary(origin_cexs, spatial_cexs, label="Initial verification")
 
@@ -387,13 +394,14 @@ def main():
     )
 
     # ── Build base grid for retraining ────────────────────────────────────────
-    x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
-    x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
-    x1_t = np.linspace(x1_min, x1_max, args.grid_pts)
-    x2_t = np.linspace(x2_min, x2_max, args.grid_pts)
-    x1g, x2g = np.meshgrid(x1_t, x2_t)
+    region_np = problem.region.numpy()
+    linspaces = [
+        np.linspace(region_np[d, 0], region_np[d, 1], args.grid_pts)
+        for d in range(problem.state_dim)
+    ]
+    mesh = np.meshgrid(*linspaces, indexing="ij")
     base_grid = torch.tensor(
-        np.stack([x1g.ravel(), x2g.ravel()], axis=1), dtype=torch.float32
+        np.stack([m.ravel() for m in mesh], axis=1), dtype=torch.float32
     )
 
     # ── Verification loop ────────────────────────────────────────────────────
@@ -412,9 +420,7 @@ def main():
     for i in range(start_iteration, args.max_iterations):
         start = time.time()
         problem.to("cpu")
-        origin_cexs, spatial_cexs, _ = _unpack_verify(
-            problem.verify(), args.epsilon
-        )
+        origin_cexs, spatial_cexs, _ = _unpack_verify(problem.verify(), args.epsilon)
         all_iter_cexs = origin_cexs + spatial_cexs
         _print_verify_summary(origin_cexs, spatial_cexs, label=f"Iteration {i}")
         cex_history.append(all_iter_cexs)
@@ -434,7 +440,7 @@ def main():
             f"(last {args.cex_window} iters)."
         )
 
-        cex_xy = [(p[0], p[1]) for p in window]
+        cex_xy = [p[:-1] for p in window]
         cex_tensor = torch.tensor(cex_xy, dtype=torch.float32)
         problem.to(device)
         grid_dev = base_grid.to(device)
