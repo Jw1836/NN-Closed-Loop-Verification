@@ -1,21 +1,28 @@
 """Defines the LyapunovProblem dataclass — the common interface
 that verifiers and the Lyapunov network are handed."""
 
-from dataclasses import dataclass
 import numpy as np
 import torch
 from torch import nn, Tensor
+from scipy.spatial import ConvexHull
 
 
-@dataclass
 class LyapunovProblem:
     """A NN Lyapunov function, dynamics, and region of interest.
     This is collectively what is verified.
     """
 
-    nn_lyapunov: nn.Module
-    dynamics: nn.Module
-    region: Tensor
+    def __init__(
+        self,
+        nn_lyapunov: nn.Module,
+        dynamics: nn.Module,
+        region: Tensor,
+    ) -> None:
+        self.nn_lyapunov = nn_lyapunov
+        self.dynamics = dynamics
+        self.region = region
+        self.hole: float = 1e-6  # Hole around origin for numerical stability
+        self.early_exit: bool = False
 
     @property
     def state_dim(self) -> int:
@@ -35,17 +42,47 @@ class LyapunovProblem:
         self.dynamics.to(device)
         return self
 
-    def check_origin(self) -> tuple[bool, "np.ndarray | None"]:
+    def check_origin(self) -> np.ndarray | None:
         """Check that V(0) = 0 (first Lyapunov condition).
 
-        Returns (True, None) if the condition holds, or (False, cex) where
-        cex is a 1-D array [x1, ..., xn, V(0)] indicating the violation.
+        Returns None if the condition holds, or a 1-D array [x1, ..., xn, V(0)]
+        indicating the violation if the condition fails.
         """
         origin = torch.zeros(1, self.state_dim, device=self.device)
         v0 = float(self.nn_lyapunov(origin).item())
         if np.isclose(v0, 0.0):
-            return True, None
-        return False, np.array([*([0.0] * self.state_dim), v0])
+            return None
+        return np.array([*([0.0] * self.state_dim), v0])
+
+    def check_positive(self, H: list[ConvexHull]) -> np.ndarray | None:
+        """Check that V(x) > 0 for all x in region except the origin (second Lyapunov condition).
+
+        Only checks convex hull vertices. Vertices within self.hole of the origin are skipped.
+
+        Returns None if the condition holds, or a 2-D array with each row
+        [x1, ..., xn, V(x)] indicating a violation.
+        """
+        all_verts = np.concatenate([hull.points[hull.vertices] for hull in H], axis=0)
+        norms = np.linalg.norm(all_verts, axis=1)
+        all_verts = all_verts[norms >= self.hole]
+
+        if len(all_verts) == 0:
+            print("Warning: all vertices at origin. Skipping.")
+            return None
+
+        x = torch.tensor(all_verts, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            v = self.nn_lyapunov(x).squeeze(1).cpu().numpy()  # (N,)
+
+        violations_mask = v <= 0.0
+        if not np.any(violations_mask):
+            return None
+
+        violating_verts = all_verts[violations_mask]
+        violating_v = v[violations_mask]
+        cex = np.concatenate([violating_verts, violating_v[:, None]], axis=1)
+
+        return cex
 
     def __repr__(self) -> str:
         region_str = ", ".join(
