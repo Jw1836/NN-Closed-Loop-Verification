@@ -563,6 +563,9 @@ def full_method(
     counterexamples : list of (float, float, float)  — (x1, x2, V_dot)
     cells : list of list[ndarray]  — ordered vertex coordinates per cell
     """
+    ## Criteria 1: V(0) = 0
+    # TODO: Call check_origin
+
     x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
     x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
 
@@ -577,11 +580,19 @@ def full_method(
     )
     print(f"  done ({time.perf_counter() - t0:.3f}s)  — {len(cells)} cells")
 
+    ## Criteria 2: V(x) > 0 for all x in region except origin
+
     print("Running verification...")
     t0 = time.perf_counter()
     dynamics_cpu = problem.dynamics.cpu()
     work_items = [
-        (cell.points[cell.vertices].tolist(), W_matrix, B_vector, W_out_vec, dynamics_cpu)
+        (
+            cell.points[cell.vertices].tolist(),
+            W_matrix,
+            B_vector,
+            W_out_vec,
+            dynamics_cpu,
+        )
         for cell in cells
     ]
     with Pool() as pool:

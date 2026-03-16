@@ -2,6 +2,7 @@
 that verifiers and the Lyapunov network are handed."""
 
 from dataclasses import dataclass
+import numpy as np
 import torch
 from torch import nn, Tensor
 
@@ -20,6 +21,10 @@ class LyapunovProblem:
     def state_dim(self) -> int:
         return self.region.shape[0]
 
+    @property
+    def device(self) -> torch.device:
+        return next(self.nn_lyapunov.parameters()).device
+
     def to(self, device: str | torch.device) -> "LyapunovProblem":
         """Move nn_lyapunov and dynamics to *device*.
 
@@ -29,6 +34,18 @@ class LyapunovProblem:
         self.nn_lyapunov.to(device)
         self.dynamics.to(device)
         return self
+
+    def check_origin(self) -> tuple[bool, "np.ndarray | None"]:
+        """Check that V(0) = 0 (first Lyapunov condition).
+
+        Returns (True, None) if the condition holds, or (False, cex) where
+        cex is a 1-D array [x1, ..., xn, V(0)] indicating the violation.
+        """
+        origin = torch.zeros(1, self.state_dim, device=self.device)
+        v0 = float(self.nn_lyapunov(origin).item())
+        if np.isclose(v0, 0.0):
+            return True, None
+        return False, np.array([*([0.0] * self.state_dim), v0])
 
     def __repr__(self) -> str:
         region_str = ", ".join(
@@ -131,9 +148,8 @@ def fine_tune_on_counterexamples(
         learning_rate:    Small LR to avoid forgetting already-correct regions.
     """
     model = problem.nn_lyapunov
-    device = next(model.parameters()).device
 
-    cex_t = torch.tensor(counterexamples, dtype=torch.float32, device=device)
+    cex_t = torch.tensor(counterexamples, dtype=torch.float32, device=problem.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     for epoch in range(num_epochs):
@@ -144,7 +160,7 @@ def fine_tune_on_counterexamples(
         V_x = model(x)
 
         # Origin condition — don't let it drift
-        origin = torch.zeros((1, 2), device=device)
+        origin = torch.zeros((1, 2), device=problem.device)
         origin_penalty = model(origin).pow(2).mean()
 
         # Lie derivative at counterexample points only
@@ -180,13 +196,12 @@ def train_lyapunov_2d(
     x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
     x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
     model = problem.nn_lyapunov
-    device = next(model.parameters()).device
 
     # First, create a training set from linearly spaced samples in grid
     x1_t = torch.linspace(x1_min, x1_max, grid_pts)
     x2_t = torch.linspace(x2_min, x2_max, grid_pts)
     x1g, x2g = torch.meshgrid(x1_t, x2_t, indexing="ij")
-    x_train = torch.stack([x1g.flatten(), x2g.flatten()], dim=1).to(device)
+    x_train = torch.stack([x1g.flatten(), x2g.flatten()], dim=1).to(problem.device)
 
     # Create an optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
