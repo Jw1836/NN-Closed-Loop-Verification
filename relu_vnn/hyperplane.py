@@ -15,7 +15,7 @@ from collections import deque
 import numpy as np
 import torch
 from scipy.optimize import linprog
-from scipy.spatial import ConvexHull, HalfspaceIntersection
+from scipy.spatial import ConvexHull, HalfspaceIntersection, QhullError
 from multiprocessing import Pool
 from typing import Callable, Sequence, cast
 from torch import nn
@@ -118,7 +118,7 @@ def enumerate_cells_bfs(
     x1_max: float,
     x2_min: float,
     x2_max: float,
-) -> list[np.ndarray]:
+) -> list[ConvexHull]:
     """Enumerate all non-empty cells of the ReLU hyperplane arrangement via BFS.
 
     Each hidden neuron defines a hyperplane ``w_i · x + b_i = 0`` that splits
@@ -140,17 +140,17 @@ def enumerate_cells_bfs(
          — flip that bit to get the neighbor's activation pattern.
       4. BFS until no unvisited neighbors remain.
 
-    Some cells leverage ``ConvexHull`` to check for degenerate intersections;
-    however, downstream methods only use vertices so ``list[np.ndarray]``
-    is the more appropriate return type.
+    Returns ``ConvexHull`` objects so callers can access both vertices
+    (``hull.points[hull.vertices]``) and halfplane equations
+    (``hull.equations``) for point-in-cell tests.
     """
-    # Seed the BFS from the domain centre
+    # Seed the BFS from the domain center
     center = np.array([(x1_min + x1_max) / 2, (x2_min + x2_max) / 2])
     sigma_0 = compute_activation_pattern(W_matrix, B_vector, center)
 
     visited: set[ActivationPattern] = {sigma_0}
     queue: deque[tuple[ActivationPattern, np.ndarray]] = deque([(sigma_0, center)])
-    cells: list[np.ndarray] = []
+    cells: list[ConvexHull] = []
 
     while queue:
         sigma, hint = queue.popleft()
@@ -175,8 +175,13 @@ def enumerate_cells_bfs(
 
         # --- Compute cell vertices ---
         try:
-            hs_obj = HalfspaceIntersection(hs, interior)
-        except Exception:
+            hs_obj = HalfspaceIntersection(
+                hs,
+                interior,
+                incremental=False,
+            )
+        except QhullError as e:
+            print(f"INFO: degenerate {QhullError} with {sigma}")
             continue  # degenerate (e.g. numerically flat cell)
 
         raw_verts = hs_obj.intersections
@@ -186,21 +191,20 @@ def enumerate_cells_bfs(
         if len(raw_verts) < 3:
             continue
         try:
-            hull = ConvexHull(raw_verts)
-        except Exception:
+            hull = ConvexHull(raw_verts, incremental=False)
+        except QhullError:
             continue  # degenerate (collinear points, etc.)
-        ordered_verts = raw_verts[hull.vertices]
-
-        if len(ordered_verts) < 3:
+        if len(hull.vertices) < 3:
             continue
 
-        cells.append(ordered_verts)
+        cells.append(hull)
 
         # --- Discover neighboring cells ---
         # A ReLU hyperplane is "tight" if at least one vertex of this cell
         # lies on it (|w_i · v + b_i| < tol).  Flipping that neuron's
         # activation bit gives the adjacent cell on the other side.
         # Vectorized: evaluate all n hyperplanes at all k vertices at once.
+        ordered_verts = raw_verts[hull.vertices]
         all_values = ordered_verts @ W_matrix + B_vector  # (k, n_hidden)
         tight_mask = np.any(np.abs(all_values) < 1e-6, axis=0)  # (n_hidden,)
 
@@ -224,11 +228,6 @@ def enumerate_cells_bfs(
 
 
 # ── Neural network utilities ───────────────────────────────────────────────────
-
-
-def _step(x: float) -> int:
-    """Heaviside step function."""
-    return 1 if x >= 0 else 0
 
 
 def extract_weights(model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -258,6 +257,11 @@ def extract_weights(model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     B_vector = layer0.bias.detach().numpy()  # (hidden_dim,)
     W_out_vec = layer2.weight.detach().numpy().flatten()  # (hidden_dim,)
     return W_matrix, B_vector, W_out_vec
+
+
+def _step(x: float) -> int:
+    """Heaviside step function."""
+    return 1 if x >= 0 else 0
 
 
 def analytic_gradient(
@@ -577,7 +581,8 @@ def full_method(
     t0 = time.perf_counter()
     dynamics_cpu = problem.dynamics.cpu()
     work_items = [
-        (cell.tolist(), W_matrix, B_vector, W_out_vec, dynamics_cpu) for cell in cells
+        (cell.points[cell.vertices].tolist(), W_matrix, B_vector, W_out_vec, dynamics_cpu)
+        for cell in cells
     ]
     with Pool() as pool:
         results = pool.map(_check_poly_worker, work_items)
@@ -587,5 +592,5 @@ def full_method(
         f"— {len(counterexamples)} counterexamples"
     )
 
-    cell_coords = [cell.tolist() for cell in cells]
+    cell_coords = [cell.points[cell.vertices].tolist() for cell in cells]
     return counterexamples, cell_coords, None
