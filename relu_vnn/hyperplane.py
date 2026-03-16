@@ -9,17 +9,14 @@ Pipeline:
   3. full_method                   - top-level orchestrator; returns counterexamples
 """
 
-import time
 from collections import deque
 
 import numpy as np
 import torch
 from scipy.optimize import linprog
 from scipy.spatial import ConvexHull, HalfspaceIntersection, QhullError
-from multiprocessing import Pool
 from typing import Callable, Sequence, cast
 from torch import nn
-from .lyapunov import LyapunovProblem
 
 # Type aliases
 ActivationPattern = tuple[bool, ...]
@@ -533,75 +530,3 @@ class Polygon:
                     return [(x1f, x2f, vdot_p)]
 
         return []
-
-
-# ── Main pipeline ──────────────────────────────────────────────────────────────
-
-
-def _check_poly_worker(args: tuple) -> list[Counterexample]:
-    vertex_coords, W_matrix, B_vector, W_out_vec, dynamics = args
-    poly = Polygon(vertex_coords)
-    return poly.check_gradient(W_matrix, B_vector, W_out_vec, dynamics)
-
-
-def full_method(
-    problem: LyapunovProblem,
-) -> tuple[list[tuple[float, float, float]], list[list[np.ndarray]], None]:
-    """End-to-end hyperplane verification pipeline.
-
-    Parameters
-    ----------
-    problem: LyapunovProblem
-        Includes
-            nn_lyapunov: nn.Module, a single-hidden-layer ReLU network
-                (network[0]=Linear, network[1]=ReLU, network[2]=Linear).
-            dynamics : nn.Module, system dynamics
-            region : Tensor, shape (2, 2), domain bounds [[x1_min, x1_max], [x2_min, x2_max]].
-
-    Returns
-    -------
-    counterexamples : list of (float, float, float)  — (x1, x2, V_dot)
-    cells : list of list[ndarray]  — ordered vertex coordinates per cell
-    """
-    ## Criteria 1: V(0) = 0
-    # TODO: Call check_origin
-
-    x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
-    x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
-
-    W_matrix, B_vector, W_out_vec = extract_weights(problem.nn_lyapunov)
-
-    bbox_hs = build_bbox_halfspaces(x1_min, x1_max, x2_min, x2_max)
-
-    print("Enumerating cells via BFS...")
-    t0 = time.perf_counter()
-    cells = enumerate_cells_bfs(
-        W_matrix, B_vector, bbox_hs, x1_min, x1_max, x2_min, x2_max
-    )
-    print(f"  done ({time.perf_counter() - t0:.3f}s)  — {len(cells)} cells")
-
-    ## Criteria 2: V(x) > 0 for all x in region except origin
-
-    print("Running verification...")
-    t0 = time.perf_counter()
-    dynamics_cpu = problem.dynamics.cpu()
-    work_items = [
-        (
-            cell.points[cell.vertices].tolist(),
-            W_matrix,
-            B_vector,
-            W_out_vec,
-            dynamics_cpu,
-        )
-        for cell in cells
-    ]
-    with Pool() as pool:
-        results = pool.map(_check_poly_worker, work_items)
-    counterexamples = [cex for batch in results for cex in batch]
-    print(
-        f"  done ({time.perf_counter() - t0:.3f}s)  "
-        f"— {len(counterexamples)} counterexamples"
-    )
-
-    cell_coords = [cell.points[cell.vertices].tolist() for cell in cells]
-    return counterexamples, cell_coords, None

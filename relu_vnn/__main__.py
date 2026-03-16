@@ -26,7 +26,6 @@ import numpy as np
 import torch
 
 from .lyapunov import LyapunovProblem, lyapunov_loss_function, train_lyapunov_2d
-from .hyperplane import full_method
 
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
@@ -96,6 +95,23 @@ def load_problem_module(problem_path: str):
         sys.exit(1)
 
     return mod
+
+
+# ── Verify result helpers ────────────────────────────────────────────────────
+
+
+def _unpack_verify(results: dict) -> tuple[list[tuple], list[list]]:
+    """Extract (counterexamples, cell_coords) from a verify() result dict."""
+    cexs: list[tuple] = []
+    for key in ("origin", "positive", "decrease"):
+        arr = results[key]
+        if arr is not None:
+            for row in np.atleast_2d(arr):
+                cexs.append(tuple(float(v) for v in row))
+
+    cells = results.get("cells", [])
+    cell_coords = [cell.points[cell.vertices].tolist() for cell in cells]
+    return cexs, cell_coords
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
@@ -301,7 +317,7 @@ def main():
 
     # ── Initial verification ──────────────────────────────────────────────────
     problem.to("cpu")
-    counterexamples_raw, polygons, _ = full_method(problem)
+    counterexamples_raw, polygons = _unpack_verify(problem.verify())
     counterexamples = [
         p for p in counterexamples_raw if (p[0] ** 2 + p[1] ** 2) >= args.epsilon**2
     ]
@@ -345,7 +361,7 @@ def main():
     for i in range(start_iteration, args.max_iterations):
         start = time.time()
         problem.to("cpu")
-        counterexamples2, _, _ = full_method(problem)
+        counterexamples2, _ = _unpack_verify(problem.verify())
         print(f"Iteration {i}: {len(counterexamples2)} counterexample(s)")
 
         counterexamples2 = [
@@ -411,7 +427,7 @@ def main():
 
     # ── Final verification ────────────────────────────────────────────────────
     problem.to("cpu")
-    final_cexs_raw, final_polygons, _ = full_method(problem)
+    final_cexs_raw, final_polygons = _unpack_verify(problem.verify())
     final_cexs = [
         p for p in final_cexs_raw if (p[0] ** 2 + p[1] ** 2) >= args.epsilon**2
     ]

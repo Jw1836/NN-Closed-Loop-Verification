@@ -1,6 +1,8 @@
 """Defines the LyapunovProblem dataclass — the common interface
 that verifiers and the Lyapunov network are handed."""
 
+import time
+
 import numpy as np
 import torch
 from torch import nn, Tensor
@@ -55,7 +57,7 @@ class LyapunovProblem:
         return np.array([*([0.0] * self.state_dim), v0])
 
     def check_positive(self, H: list[ConvexHull]) -> np.ndarray | None:
-        """Check that V(x) > 0 for all x in region except the origin (second Lyapunov condition).
+        """Check that V(x) > 0 for all x in region, except the origin (second Lyapunov condition).
 
         Only checks convex hull vertices. Vertices within self.hole of the origin are skipped.
 
@@ -83,6 +85,100 @@ class LyapunovProblem:
         cex = np.concatenate([violating_verts, violating_v[:, None]], axis=1)
 
         return cex
+
+    def check_decrease(self, H: list[ConvexHull]) -> np.ndarray | None:
+        """Check that ∇V(x)·f(x) < 0 everywhere except the origin (third Lyapunov condition).
+
+        Returns None if the condition holds, or a 2-D array with each row
+        [x1, x2, V_dot] indicating a violation.
+        """
+        # TODO
+        return None
+
+    def verify(self) -> dict[str, np.ndarray | list[ConvexHull] | None]:
+        """Run all three Lyapunov checks.
+
+        Returns a dict with keys:
+            "origin"   — None if V(0)=0 holds, else ndarray [x1,...,xn, V(0)]
+            "positive" — None if V(x)>0 holds, else ndarray of violation rows
+            "decrease" — None if V_dot<0 holds, else ndarray of violation rows
+            "cells"    — list[ConvexHull], the cell decomposition (for plotting)
+        """
+        from .hyperplane import (
+            extract_weights,
+            build_bbox_halfspaces,
+            enumerate_cells_bfs,
+        )
+
+        results: dict[str, np.ndarray | list[ConvexHull] | None] = {
+            "origin": None,
+            "positive": None,
+            "decrease": None,
+        }
+
+        x1_min, x1_max = self.region[0, 0].item(), self.region[0, 1].item()
+        x2_min, x2_max = self.region[1, 0].item(), self.region[1, 1].item()
+
+        W_matrix, B_vector, _ = extract_weights(self.nn_lyapunov)
+        bbox_hs = build_bbox_halfspaces(x1_min, x1_max, x2_min, x2_max)
+
+        print("Enumerating cells via BFS...")
+        t0 = time.perf_counter()
+        cells = enumerate_cells_bfs(
+            W_matrix, B_vector, bbox_hs, x1_min, x1_max, x2_min, x2_max
+        )
+        print(f"  done ({time.perf_counter() - t0:.3f}s)  — {len(cells)} cells")
+
+        # Criteria 1: V(0) = 0
+        print("Checking origin condition...")
+        t0 = time.perf_counter()
+        results["origin"] = self.check_origin()
+        print(f"  done ({time.perf_counter() - t0:.3f}s)")
+        if (cex := results["origin"]) is not None:
+            print(f"Found {len(cex)} counterexamples.")
+            if self.early_exit:
+                print("Violation found! Exiting early.")
+                return results
+        else:
+            print("Check passed!")
+
+        # Criteria 2: V(x) > 0
+        print("Checking positive condition...")
+        t0 = time.perf_counter()
+        results["positive"] = self.check_positive(cells)
+        print(f"  done ({time.perf_counter() - t0:.3f}s)")
+        if (cex := results["positive"]) is not None:
+            print(f"Found {len(cex)} counterexamples.")
+            if self.early_exit:
+                print("Violation found! Exiting early.")
+                return results
+        else:
+            print("Check passed!")
+
+        # Criteria 3: V_dot < 0
+        print("Checking decrease condition...")
+        t0 = time.perf_counter()
+        results["decrease"] = self.check_decrease(cells)
+        print(f"  done ({time.perf_counter() - t0:.3f}s)")
+        if (cex := results["decrease"]) is not None:
+            print(f"Found {len(cex)} counterexamples.")
+            if self.early_exit:
+                print("Violation found! Exiting early.")
+                return results
+        else:
+            print("Check passed!")
+
+        # Save cells for plotting even if all checks pass.
+        results["cells"] = cells
+        print("Verification complete.")
+        print("Summary of results:")
+        for key in ["origin", "positive", "decrease"]:
+            if results[key] is None:
+                print(f"  {key}: PASSED")
+            else:
+                print(f"  {key}: FAILED with {len(results[key])} counterexamples")  # type: ignore
+        print(f"  cells: {len(results['cells'])} returned for plotting")
+        return results
 
     def __repr__(self) -> str:
         region_str = ", ".join(
