@@ -96,6 +96,27 @@ class LyapunovProblem:
         # TODO
         return None
 
+    def enumerate_cells(self) -> list[ConvexHull]:
+        """Build the ReLU activation-pattern cell decomposition for this network and region."""
+        from .hyperplane import (
+            extract_weights,
+            build_bbox_halfspaces,
+            enumerate_cells_bfs,
+        )
+
+        region_np = self.region.numpy()
+        print("Extracting weights and building bounding-box halfspaces...")
+        t0 = time.perf_counter()
+        W_matrix, B_vector, _ = extract_weights(self.nn_lyapunov)
+        bbox_hs = build_bbox_halfspaces(region_np)
+        print(f"  done ({time.perf_counter() - t0:.3f}s)")
+
+        print("Enumerating cells via BFS...")
+        t0 = time.perf_counter()
+        cells = enumerate_cells_bfs(W_matrix, B_vector, bbox_hs, region_np)
+        print(f"  done ({time.perf_counter() - t0:.3f}s)  — {len(cells)} cells")
+        return cells
+
     def verify(self) -> dict[str, np.ndarray | list[ConvexHull] | None]:
         """Run all three Lyapunov checks.
 
@@ -105,27 +126,12 @@ class LyapunovProblem:
             "decrease" — None if V_dot<0 holds, else ndarray of violation rows
             "cells"    — list[ConvexHull], the cell decomposition (for plotting)
         """
-        from .hyperplane import (
-            extract_weights,
-            build_bbox_halfspaces,
-            enumerate_cells_bfs,
-        )
 
         results: dict[str, np.ndarray | list[ConvexHull] | None] = {
             "origin": None,
             "positive": None,
             "decrease": None,
         }
-
-        region_np = self.region.numpy()
-
-        W_matrix, B_vector, _ = extract_weights(self.nn_lyapunov)
-        bbox_hs = build_bbox_halfspaces(region_np)
-
-        print("Enumerating cells via BFS...")
-        t0 = time.perf_counter()
-        cells = enumerate_cells_bfs(W_matrix, B_vector, bbox_hs, region_np)
-        print(f"  done ({time.perf_counter() - t0:.3f}s)  — {len(cells)} cells")
 
         # Criteria 1: V(0) = 0
         print("Checking origin condition...")
@@ -139,6 +145,9 @@ class LyapunovProblem:
                 return results
         else:
             print("Check passed!")
+
+        # Build the cell decomposition for the next two checks.
+        cells = self.enumerate_cells()
 
         # Criteria 2: V(x) > 0
         print("Checking positive condition...")
@@ -166,8 +175,9 @@ class LyapunovProblem:
         else:
             print("Check passed!")
 
-        # Save cells for plotting even if all checks pass.
+        # Return even if all checks pass; good for plots or analysis.
         results["cells"] = cells
+
         print("Verification complete.")
         print("Summary of results:")
         for key in ["origin", "positive", "decrease"]:
@@ -175,7 +185,7 @@ class LyapunovProblem:
                 print(f"  {key}: PASSED")
             else:
                 print(f"  {key}: FAILED with {len(results[key])} counterexamples")  # type: ignore
-        print(f"  cells: {len(results['cells'])} returned for plotting")
+        print(f"  cells: {len(results['cells'])} returned.")
         return results
 
     def __repr__(self) -> str:
