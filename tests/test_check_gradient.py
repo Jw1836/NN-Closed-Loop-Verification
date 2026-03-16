@@ -55,8 +55,8 @@ B_IN = np.array([0.0, 0.0])
 W_OUT = np.array([[1.0, 1.0]])  # (1, hidden=2)
 
 # Weight arrays in the shape analytic_gradient expects:
-W_MATRIX = W_IN.T   # (input=2, hidden=2)
-B_VECTOR = B_IN     # (hidden=2,)
+W_MATRIX = W_IN.T  # (input=2, hidden=2)
+B_VECTOR = B_IN  # (hidden=2,)
 W_OUT_VEC = W_OUT.flatten()  # (hidden=2,)
 
 # A polygon fully inside the first quadrant — both neurons active.
