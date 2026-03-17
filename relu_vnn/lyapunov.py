@@ -117,6 +117,15 @@ class LyapunovProblem:
             # Align polytope with the basis vector
             q1, _ = align_basis(c, grad)
 
+            # Define the rotated dynamics: v_i_1 = q1 @ f(x)
+            # This is the function to maximize over the cell
+            def v_i_1(x):
+                """Rotated first component of dynamics: q1 @ f(x)."""
+                x_tensor = torch.tensor(np.atleast_1d(x), dtype=torch.float32)
+                with torch.no_grad():
+                    f_x = self.dynamics(x_tensor).numpy()
+                return float(q1 @ f_x)
+
             # --- Batched vertex pre-check ---
             # Evaluate dynamics at all vertices in one forward pass
             verts = c.intersections

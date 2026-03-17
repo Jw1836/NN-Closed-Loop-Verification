@@ -349,31 +349,20 @@ def align_basis(
         ``cell.intersections`` after applying Q.
     """
     g = np.asarray(gradient, dtype=float).flatten()
-    n = g.shape[0]
-    g_hat = g / np.linalg.norm(g)
+    g_norm = np.linalg.norm(g)
+    if g_norm < 1e-10:
+        raise ValueError("Gradient is zero; cannot align basis.")
+    e_1 = np.zeros_like(g)
+    e_1[0] = 1.0
+    v = g - g_norm * e_1
+    H = np.eye(len(g)) - 2 * np.outer(v, v) / np.dot(v, v)
+    #make sure the this correctly rotates g to be in line with e_1
+    #exit early if it fails, since the rest of the code relies on this being correct
+    if not np.allclose(H @ g, g_norm * e_1, atol=1e-10):
+        raise SystemExit("Householder reflection failed to align gradient")
+    q1 = H[0, :] # first row of H
+    return q1, None
 
-    e1 = np.zeros(n)
-    e1[0] = 1.0
-
-    v = g_hat - e1
-    vtv = np.dot(v, v)
-
-    # Pull it here to avoid more lookups
-    vertices = cell.intersections
-
-    if vtv < 1e-14:
-        # gradient already aligned with e_1
-        return e1.copy(), vertices.copy()
-
-    # Matrix-free rotation: Q @ x = x - 2 v (v^T x) / (v^T v)
-    # For rows of `vertices` (shape m x n): proj has shape (m,)
-    proj = (vertices @ v) / vtv
-    rotated_vertices = vertices - 2.0 * np.outer(proj, v)
-
-    # First row of Q: e_1 - 2 v[0] v / (v^T v)
-    q1 = e1 - 2.0 * v[0] * v / vtv
-
-    return q1, rotated_vertices
 
 
 def contains_point(cell: HalfspaceIntersection, point: np.ndarray) -> bool:
