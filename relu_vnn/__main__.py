@@ -296,7 +296,7 @@ def main():
     parser.add_argument(
         "--epsilon",
         type=float,
-        default=1e-4,
+        default=1e-8,
         help="Skip spatial counterexamples within this distance of origin",
     )
     parser.add_argument(
