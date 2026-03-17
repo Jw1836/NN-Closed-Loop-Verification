@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, HalfspaceIntersection
 
 from relu_vnn.hyperplane import (
     build_bbox_halfspaces,
@@ -28,10 +28,10 @@ def cells():
     return enumerate_cells_bfs(W_MATRIX, B_VECTOR, BBOX_HS, REGION)
 
 
-def test_returns_list_of_convex_hulls(cells):
+def test_returns_list_of_halfspace_intersections(cells):
     assert isinstance(cells, list)
     assert len(cells) > 0
-    assert all(isinstance(c, ConvexHull) for c in cells)
+    assert all(isinstance(c, HalfspaceIntersection) for c in cells)
 
 
 def test_four_quadrant_cells(cells):
@@ -39,32 +39,32 @@ def test_four_quadrant_cells(cells):
 
 
 def test_cells_have_vertices(cells):
-    for hull in cells:
-        verts = hull.points[hull.vertices]
+    for cell in cells:
+        verts = cell.intersections
         assert verts.shape[0] >= 3
         assert verts.shape[1] == 2
 
 
-def test_cells_have_equations(cells):
-    for hull in cells:
-        # equations shape: (n_facets, ndim+1) = (n_facets, 3)
-        assert hull.equations.shape[1] == 3
-        assert hull.equations.shape[0] >= 3
+def test_cells_have_halfspaces(cells):
+    for cell in cells:
+        # halfspaces shape: (n_constraints, ndim+1) = (n_constraints, 3)
+        assert cell.halfspaces.shape[1] == 3
+        assert cell.halfspaces.shape[0] >= 3
 
 
 def test_cells_tile_domain(cells):
     """Total area of cells should equal the bounding box area (4.0)."""
-    total = sum(hull.volume for hull in cells)  # .volume is area in 2D
+    total = sum(ConvexHull(cell.intersections).volume for cell in cells)
     assert total == pytest.approx(4.0, abs=1e-8)
 
 
-def test_point_in_cell_via_equations(cells):
-    """A point known to be in a quadrant should satisfy that cell's equations."""
+def test_point_in_cell_via_halfspaces(cells):
+    """A point known to be in a quadrant should satisfy that cell's halfspaces."""
     test_point = np.array([0.5, 0.5])  # first quadrant
     found = False
-    for hull in cells:
-        eq = hull.equations
-        if np.all(eq[:, :2] @ test_point + eq[:, -1] <= 1e-10):
+    for cell in cells:
+        hs = cell.halfspaces
+        if np.all(hs[:, :2] @ test_point + hs[:, -1] <= 1e-10):
             found = True
             break
     assert found
@@ -110,15 +110,15 @@ def test_3d_eight_octant_cells(cells_3d):
 
 
 def test_3d_cells_have_correct_dimension(cells_3d):
-    for hull in cells_3d:
-        verts = hull.points[hull.vertices]
+    for cell in cells_3d:
+        verts = cell.intersections
         assert verts.shape[1] == 3
         assert verts.shape[0] >= 4  # state_dim + 1
 
 
 def test_3d_cells_tile_domain(cells_3d):
     """Total volume of cells should equal the bounding box volume (8.0)."""
-    total = sum(hull.volume for hull in cells_3d)
+    total = sum(ConvexHull(cell.intersections).volume for cell in cells_3d)
     assert total == pytest.approx(8.0, abs=1e-6)
 
 
@@ -126,8 +126,8 @@ def test_3d_point_in_cell(cells_3d):
     """A point in a known octant should be inside exactly one cell."""
     test_point = np.array([0.5, 0.5, 0.5])
     found = 0
-    for hull in cells_3d:
-        eq = hull.equations
-        if np.all(eq[:, :3] @ test_point + eq[:, -1] <= 1e-10):
+    for cell in cells_3d:
+        hs = cell.halfspaces
+        if np.all(hs[:, :3] @ test_point + hs[:, -1] <= 1e-10):
             found += 1
     assert found == 1

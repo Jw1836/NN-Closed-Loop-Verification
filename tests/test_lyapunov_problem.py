@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 from torch import nn, Tensor
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, HalfspaceIntersection
 
 from relu_vnn.lyapunov import LyapunovProblem
 
@@ -39,9 +39,11 @@ def _make_problem(net: nn.Module) -> LyapunovProblem:
     return LyapunovProblem(net, dynamics, region)
 
 
-def _unit_square_hull() -> list[ConvexHull]:
+def _unit_square_hs() -> list[HalfspaceIntersection]:
     pts = np.array([[0.5, 0.5], [0.5, -0.5], [-0.5, 0.5], [-0.5, -0.5]])
-    return [ConvexHull(pts)]
+    hull = ConvexHull(pts)
+    interior = pts.mean(axis=0)
+    return [HalfspaceIntersection(hull.equations, interior)]
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +86,12 @@ class TestCheckPositive:
         # SumSquares is strictly positive away from origin; hull vertices are
         # well outside the default hole radius so all should pass.
         prob = _make_problem(SumSquares())
-        assert prob.check_positive(_unit_square_hull()) is None
+        assert prob.check_positive(_unit_square_hs()) is None
 
     def test_detects_violation_when_v_nonpositive(self):
         # Constant 0 is not > 0, so all hull vertices should be returned.
         prob = _make_problem(ConstantNet(0.0))
-        result = prob.check_positive(_unit_square_hull())
+        result = prob.check_positive(_unit_square_hs())
         assert result is not None
         assert result.ndim == 2
         assert result.shape[1] == prob.state_dim + 1
@@ -98,22 +100,22 @@ class TestCheckPositive:
 
     def test_violation_rows_contain_correct_coordinates(self):
         prob = _make_problem(ConstantNet(-1.0))
-        H = _unit_square_hull()
-        result = prob.check_positive(H)
+        result = prob.check_positive(_unit_square_hs())
         assert result is not None
         # Verify each violating point actually evaluates to -1.0
         assert np.allclose(result[:, -1], -1.0)
 
     def test_skips_vertices_within_hole(self):
-        # If all hull vertices are inside the hole radius, we get a warning
-        # and None is returned (no violation detected).
+        # If all intersections are inside the hole radius, None is returned.
         pts = np.array([[1e-8, 0.0], [0.0, 1e-8], [-1e-8, 0.0], [0.0, -1e-8]])
         try:
             hull = ConvexHull(pts)
+            interior = pts.mean(axis=0)
+            hs = HalfspaceIntersection(hull.equations, interior)
         except Exception:
             pytest.skip("Degenerate hull — scipy version dependent")
 
         prob = _make_problem(ConstantNet(-1.0))
         prob.hole = 1.0  # large hole swallows all vertices
-        result = prob.check_positive([hull])
+        result = prob.check_positive([hs])
         assert result is None

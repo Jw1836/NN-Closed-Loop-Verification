@@ -5,8 +5,7 @@ Hyperplane arrangement verification for neural Lyapunov functions.
 
 Pipeline:
   1. enumerate_cells_bfs           - BFS over activation patterns to find all cells
-  2. Polygon.check_gradient        - rotate, count sign regions, check dynamics
-  3. full_method                   - top-level orchestrator; returns counterexamples
+  2. align_basis / check_decrease  - rotate cell, verify Lie derivative per cell
 """
 
 from collections import deque
@@ -14,7 +13,7 @@ from collections import deque
 import numpy as np
 import torch
 from scipy.optimize import linprog
-from scipy.spatial import ConvexHull, HalfspaceIntersection, QhullError
+from scipy.spatial import HalfspaceIntersection
 from typing import Sequence, cast
 from torch import nn
 
@@ -126,7 +125,7 @@ def enumerate_cells_bfs(
     B_vector: np.ndarray,
     bbox_hs: np.ndarray,
     region: np.ndarray,
-) -> list[ConvexHull]:
+) -> list[HalfspaceIntersection]:
     """Enumerate all non-empty cells of the ReLU hyperplane arrangement via BFS.
 
     Each hidden neuron defines a hyperplane ``w_i · x + b_i = 0`` that splits
@@ -148,10 +147,12 @@ def enumerate_cells_bfs(
          — flip that bit to get the neighbor's activation pattern.
       4. BFS until no unvisited neighbors remain.
 
-    Returns ``ConvexHull`` objects so callers can access both vertices
-    (``hull.points[hull.vertices]``) and halfplane equations
-    (``hull.equations``) for point-in-cell tests.
+    Returns ``HalfspaceIntersection`` objects so callers can access both
+    * vertices (``cell.intersections``) and
+    * halfplane equations (``cell.halfspaces``) for point-in-cell tests.
     """
+    from scipy.spatial import ConvexHull, QhullError
+
     # Seed the BFS from the domain center
     state_dim = region.shape[0]
     center = region.mean(axis=1)
@@ -159,7 +160,7 @@ def enumerate_cells_bfs(
 
     visited: set[ActivationPattern] = {sigma_0}
     queue: deque[tuple[ActivationPattern, np.ndarray]] = deque([(sigma_0, center)])
-    cells: list[ConvexHull] = []
+    cells: list[HalfspaceIntersection] = []
 
     while queue:
         sigma, hint = queue.popleft()
@@ -205,7 +206,7 @@ def enumerate_cells_bfs(
         if len(hull.vertices) < state_dim + 1:
             continue
 
-        cells.append(hull)
+        cells.append(hs_obj)
 
         # --- Discover neighboring cells ---
         # A ReLU hyperplane is "tight" if at least one vertex of this cell
@@ -319,11 +320,11 @@ def verify_point(
     return float(grad[0] * f1 + grad[1] * f2) < 0
 
 
-# ── ConvexHull functions ───────────────────────────────────────────────────────
+# ── Cell alignment and rotation ───────────────────────────────────────────────
 
 
 def align_basis(
-    cell: ConvexHull,
+    cell: HalfspaceIntersection,
     gradient: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Rotate cell vertices so that *gradient* aligns with E_1, matrix-free.
@@ -335,8 +336,8 @@ def align_basis(
 
     Parameters
     ----------
-    cell : ConvexHull
-        Polytope whose vertices live in R^n.
+    cell : HalfspaceIntersection
+        Polytope whose vertices are stored in ``cell.intersections``.
     gradient : ndarray, shape (n,) or (n, 1)
         Non-zero gradient of the Lyapunov function in this cell.
 
@@ -344,8 +345,8 @@ def align_basis(
     -------
     q1 : ndarray, shape (n,)
         First row of Q.  ``q1 @ f`` gives the rotated first component of f.
-    rotated_vertices : ndarray, shape (num_vertices, n)
-        Cell vertices after applying Q.
+    rotated_vertices : ndarray, shape (num_intersections, n)
+        ``cell.intersections`` after applying Q.
     """
     g = np.asarray(gradient, dtype=float).flatten()
     n = g.shape[0]
@@ -357,7 +358,8 @@ def align_basis(
     v = g_hat - e1
     vtv = np.dot(v, v)
 
-    vertices = cell.points[cell.vertices]
+    # Pull it here to avoid more lookups
+    vertices = cell.intersections
 
     if vtv < 1e-14:
         # gradient already aligned with e_1

@@ -6,7 +6,7 @@ import time
 import numpy as np
 import torch
 from torch import nn, Tensor
-from scipy.spatial import ConvexHull
+from scipy.spatial import HalfspaceIntersection
 
 
 class LyapunovProblem:
@@ -57,7 +57,7 @@ class LyapunovProblem:
         # Return 2-D array (1, state_dim+1) for consistency with other checks
         return np.array([[*([0.0] * self.state_dim), v0]])
 
-    def check_positive(self, H: list[ConvexHull]) -> np.ndarray | None:
+    def check_positive(self, H: list[HalfspaceIntersection]) -> np.ndarray | None:
         """Check that V(x) > 0 for all x in region, except the origin (second Lyapunov condition).
 
         Only checks convex hull vertices. Vertices within self.hole of the origin are skipped.
@@ -65,7 +65,7 @@ class LyapunovProblem:
         Returns None if the condition holds, or a 2-D array with each row
         [x1, ..., xn, V(x)] indicating a violation.
         """
-        all_verts = np.concatenate([hull.points[hull.vertices] for hull in H], axis=0)
+        all_verts = np.concatenate([cell.intersections for cell in H], axis=0)
         norms = np.linalg.norm(all_verts, axis=1)
         all_verts = all_verts[norms >= self.hole]
 
@@ -87,7 +87,7 @@ class LyapunovProblem:
 
         return cex
 
-    def check_decrease(self, cells: list[ConvexHull]) -> np.ndarray | None:
+    def check_decrease(self, cells: list[HalfspaceIntersection]) -> np.ndarray | None:
         """Check that ∇V(x)·f(x) < 0 everywhere except the origin (third Lyapunov condition).
 
         Returns None if the condition holds, or a 2-D array with each row
@@ -99,13 +99,12 @@ class LyapunovProblem:
         violations: list[np.ndarray] = []
 
         for c in cells:
-            # Calculate cell's gradient at the centroid
-            centroid = c.points[c.vertices].mean(axis=0)
-            grad = analytic_gradient(W_matrix, B_vector, W_out_vec, centroid)
+            # Calculate cell's gradient at interior point
+            grad = analytic_gradient(W_matrix, B_vector, W_out_vec, c.interior_point)
 
             # If gradient is zero, V_dot = 0 everywhere in cell, means counterexample
             if np.linalg.norm(grad) < 1e-10:
-                violations.append(np.append(centroid, 0.0))
+                violations.append(np.append(c.interior_point, 0.0))
                 continue
 
             # Align polytope with the basis vector
@@ -118,7 +117,7 @@ class LyapunovProblem:
 
         return None if not violations else np.vstack(violations)
 
-    def enumerate_cells(self) -> list[ConvexHull]:
+    def enumerate_cells(self) -> list[HalfspaceIntersection]:
         """Build the ReLU activation-pattern cell decomposition for this network and region."""
         from .hyperplane import (
             extract_weights,
@@ -139,17 +138,17 @@ class LyapunovProblem:
         print(f"  done ({time.perf_counter() - t0:.3f}s)  — {len(cells)} cells")
         return cells
 
-    def verify(self) -> dict[str, np.ndarray | list[ConvexHull] | None]:
+    def verify(self) -> dict[str, np.ndarray | list[HalfspaceIntersection] | None]:
         """Run all three Lyapunov checks.
 
         Returns a dict with keys:
             "origin"   — None if V(0)=0 holds, else ndarray [x1,...,xn, V(0)]
             "positive" — None if V(x)>0 holds, else ndarray of violation rows
             "decrease" — None if V_dot<0 holds, else ndarray of violation rows
-            "cells"    — list[ConvexHull], the cell decomposition (for plotting)
+            "cells"    — list[HalfspaceIntersection], the set of convex polytopes
         """
 
-        results: dict[str, np.ndarray | list[ConvexHull] | None] = {
+        results: dict[str, np.ndarray | list[HalfspaceIntersection] | None] = {
             "origin": None,
             "positive": None,
             "decrease": None,

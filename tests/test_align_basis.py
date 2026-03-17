@@ -2,14 +2,16 @@
 
 import numpy as np
 import pytest
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, HalfspaceIntersection
 
 from relu_vnn.hyperplane import align_basis
 
 
-def _make_hull(vertices: np.ndarray) -> ConvexHull:
-    """Create a ConvexHull from an array of vertices."""
-    return ConvexHull(vertices)
+def _make_hs(vertices: np.ndarray) -> HalfspaceIntersection:
+    """Create a HalfspaceIntersection from a set of vertices."""
+    hull = ConvexHull(vertices)
+    interior = vertices.mean(axis=0)
+    return HalfspaceIntersection(hull.equations, interior)
 
 
 # ── 3-D ──────────────────────────────────────────────────────────────────────
@@ -21,7 +23,7 @@ class TestAlignBasis3D:
     @pytest.fixture()
     def tetrahedron(self):
         verts = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=float)
-        return _make_hull(verts)
+        return _make_hs(verts)
 
     def test_gradient_along_e3(self, tetrahedron):
         """Gradient along e_3 — q1 should pick out the z component."""
@@ -38,9 +40,9 @@ class TestAlignBasis3D:
     def test_preserves_volume(self, tetrahedron):
         grad = np.array([1.0, 2.0, -3.0])
         _, rv = align_basis(tetrahedron, grad)
-        orig_hull = tetrahedron
+        orig_vol = ConvexHull(tetrahedron.intersections).volume
         rot_hull = ConvexHull(rv)
-        np.testing.assert_allclose(rot_hull.volume, orig_hull.volume, atol=1e-12)
+        np.testing.assert_allclose(rot_hull.volume, orig_vol, atol=1e-12)
 
 
 # ── 2-D ──────────────────────────────────────────────────────────────────────
@@ -51,14 +53,13 @@ class TestAlignBasis2D:
 
     @pytest.fixture()
     def square(self):
-        return _make_hull(np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=float))
+        return _make_hs(np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=float))
 
     def test_gradient_along_e1(self, square):
-        """Gradient already along e_1 — identity rotation."""
+        """Gradient already along e_1 — identity rotation, rv == intersections."""
         q1, rv = align_basis(square, np.array([2.0, 0.0]))
         np.testing.assert_allclose(q1, [1.0, 0.0], atol=1e-12)
-        verts = square.points[square.vertices]
-        np.testing.assert_allclose(rv, verts, atol=1e-12)
+        np.testing.assert_allclose(rv, square.intersections, atol=1e-12)
 
     def test_gradient_along_e2(self, square):
         """Gradient along e_2 — 90-degree rotation."""
@@ -78,7 +79,7 @@ class TestAlignBasis2D:
         """Householder is orthogonal, so pairwise distances are preserved."""
         grad = np.array([3.0, -4.0])
         _, rv = align_basis(square, grad)
-        verts = square.points[square.vertices]
+        verts = square.intersections
         orig_dists = np.linalg.norm(verts[:, None] - verts[None, :], axis=-1)
         rot_dists = np.linalg.norm(rv[:, None] - rv[None, :], axis=-1)
         np.testing.assert_allclose(rot_dists, orig_dists, atol=1e-12)
@@ -100,7 +101,7 @@ class TestAlignBasis5D:
         """A 5-D simplex (6 vertices)."""
         verts = np.eye(5) * 2.0
         verts = np.vstack([verts, np.zeros(5)])
-        return _make_hull(verts)
+        return _make_hs(verts)
 
     def test_q1_maps_gradient_to_e1(self, simplex_5d):
         rng = np.random.default_rng(42)
@@ -119,7 +120,7 @@ class TestAlignBasis5D:
         rng = np.random.default_rng(7)
         grad = rng.standard_normal(5)
         _, rv = align_basis(simplex_5d, grad)
-        verts = simplex_5d.points[simplex_5d.vertices]
+        verts = simplex_5d.intersections
         orig_dists = np.linalg.norm(verts[:, None] - verts[None, :], axis=-1)
         rot_dists = np.linalg.norm(rv[:, None] - rv[None, :], axis=-1)
         np.testing.assert_allclose(rot_dists, orig_dists, atol=1e-12)

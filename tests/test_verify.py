@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, HalfspaceIntersection
 
 from problems.bilinear_oscillator import BilinearProblem
 
@@ -18,12 +18,12 @@ class TestVerify:
         results = problem.verify()
         assert set(results.keys()) >= {"origin", "positive", "decrease", "cells"}
 
-    def test_cells_are_convex_hulls(self, problem):
+    def test_cells_are_halfspace_intersections(self, problem):
         results = problem.verify()
         cells = results["cells"]
         assert isinstance(cells, list)
         assert len(cells) > 0
-        assert all(isinstance(c, ConvexHull) for c in cells)
+        assert all(isinstance(c, HalfspaceIntersection) for c in cells)
 
     def test_cells_tile_region(self, problem):
         """Cell areas should sum to the bounding-box area."""
@@ -32,7 +32,7 @@ class TestVerify:
             (problem.region[0, 1] - problem.region[0, 0])
             * (problem.region[1, 1] - problem.region[1, 0])
         )
-        cell_area = sum(c.volume for c in results["cells"])
+        cell_area = sum(ConvexHull(c.intersections).volume for c in results["cells"])
         assert cell_area == pytest.approx(region_area, abs=1e-6)
 
     def test_check_results_are_ndarray_or_none(self, problem):

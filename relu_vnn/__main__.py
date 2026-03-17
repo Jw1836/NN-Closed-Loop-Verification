@@ -24,6 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from typing import cast
 
 from .lyapunov import LyapunovProblem, lyapunov_loss_function, train_lyapunov_2d
 
@@ -113,6 +114,8 @@ def _unpack_verify(
 
     Returns (origin_cexs, spatial_cexs, cell_coords).
     """
+    from scipy.spatial import HalfspaceIntersection
+
     origin_cexs: list[tuple] = []
     spatial_cexs: list[tuple] = []
 
@@ -132,8 +135,8 @@ def _unpack_verify(
                 if dist_sq >= epsilon**2:
                     spatial_cexs.append(pt)
 
-    cells = results.get("cells", [])
-    cell_coords = [cell.points[cell.vertices].tolist() for cell in cells]
+    cells = cast(list[HalfspaceIntersection], results.get("cells", []))
+    cell_coords = [cell.intersections.tolist() for cell in cells]
     return origin_cexs, spatial_cexs, cell_coords
 
 
