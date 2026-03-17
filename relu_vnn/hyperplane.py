@@ -320,7 +320,7 @@ def verify_point(
     return float(grad[0] * f1 + grad[1] * f2) < 0
 
 
-# ── Cell alignment and rotation ───────────────────────────────────────────────
+# ── Cell functions ───────────────────────────────────────────────
 
 
 def align_basis(
@@ -374,3 +374,10 @@ def align_basis(
     q1 = e1 - 2.0 * v[0] * v / vtv
 
     return q1, rotated_vertices
+
+
+def contains_point(cell: HalfspaceIntersection, point: np.ndarray) -> bool:
+    """Uses the matrix inequality Ax <= b of the halfspaces to test if
+    a point lies inside a convex polytope."""
+    # Each row of cell.halfspaces is [A_row | b] with constraint A_row @ x + b <= 0
+    return bool(np.all(cell.halfspaces[:, :-1] @ point + cell.halfspaces[:, -1] <= 0))
