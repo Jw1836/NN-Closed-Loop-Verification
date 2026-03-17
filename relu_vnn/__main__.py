@@ -1,4 +1,4 @@
-"""CEGIS loop for ReLU Lyapunov verification.
+"""Verification loop for ReLU Lyapunov functions.
 
 Usage:
     python -m relu_vnn <problem_file.py> [options]
@@ -24,9 +24,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from typing import cast
 
 from .lyapunov import LyapunovProblem, lyapunov_loss_function, train_lyapunov_2d
-from .hyperplane import full_method
 
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
@@ -61,9 +61,11 @@ def append_cex_log(cex_log_path: str, iteration: int, cexs: list[tuple]):
     with open(cex_log_path, "a", newline="") as f:
         writer = csv.writer(f)
         if write_header:
-            writer.writerow(["iteration", "x1", "x2", "dVx"])
+            # state dims + value column (last element of each cex tuple)
+            state_cols = [f"x{i + 1}" for i in range(len(cexs[0]) - 1)]
+            writer.writerow(["iteration"] + state_cols + ["dVx"])
         for p in cexs:
-            writer.writerow([iteration, p[0], p[1], p[2]])
+            writer.writerow([iteration] + list(p))
 
 
 # ── Problem loader ────────────────────────────────────────────────────────────
@@ -98,6 +100,61 @@ def load_problem_module(problem_path: str):
     return mod
 
 
+# ── Verify result helpers ────────────────────────────────────────────────────
+
+
+def _unpack_verify(
+    results: dict, epsilon: float
+) -> tuple[list[tuple], list[tuple], list[list]]:
+    """Extract counterexamples from a verify() result dict.
+
+    Origin failures are never filtered (V(0)!=0 is a categorical failure).
+    Positivity/decrease counterexamples within *epsilon* of the origin are
+    filtered out (numerical noise near the equilibrium).
+
+    Returns (origin_cexs, spatial_cexs, cell_coords).
+    """
+    from scipy.spatial import HalfspaceIntersection
+
+    origin_cexs: list[tuple] = []
+    spatial_cexs: list[tuple] = []
+
+    # Origin — always kept, never distance-filtered
+    arr = results["origin"]
+    if arr is not None:
+        for row in np.atleast_2d(arr):
+            origin_cexs.append(tuple(float(v) for v in row))
+
+    # Positivity + decrease — distance-filtered
+    for key in ("positive", "decrease"):
+        arr = results[key]
+        if arr is not None:
+            for row in np.atleast_2d(arr):
+                pt = tuple(float(v) for v in row)
+                dist_sq = sum(v**2 for v in pt[:-1])
+                if dist_sq >= epsilon**2:
+                    spatial_cexs.append(pt)
+
+    cells = cast(list[HalfspaceIntersection], results.get("cells", []))
+    cell_coords = [cell.intersections.tolist() for cell in cells]
+    return origin_cexs, spatial_cexs, cell_coords
+
+
+def _print_verify_summary(
+    origin_cexs: list[tuple], spatial_cexs: list[tuple], label: str = "Result"
+):
+    """Print a human-readable summary of verification results."""
+    parts = []
+    if origin_cexs:
+        parts.append(f"origin: FAILED (V(0)={origin_cexs[0][-1]:.6f})")
+    if spatial_cexs:
+        parts.append(f"{len(spatial_cexs)} spatial counterexample(s)")
+    if not parts:
+        print(f"\n{label}: PASSED — no counterexamples.")
+    else:
+        print(f"\n{label}: {', '.join(parts)}")
+
+
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
 
@@ -107,10 +164,14 @@ def plot_verification(
     problem: LyapunovProblem,
     counterexamples,
     polygons,
-    vertex_dict,
     grid_pts: int,
     title: str,
 ):
+    if problem.state_dim != 2:
+        print(
+            f"Plotting skipped (only supported for 2D problems, got {problem.state_dim}D)"
+        )
+        return
     x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
     x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
 
@@ -125,8 +186,7 @@ def plot_verification(
         V = problem.nn_lyapunov(plot_pts).numpy().reshape(x1g.shape)
     ax.contourf(x1g, x2g, V, levels=20, cmap="viridis", alpha=0.5)
     ax.contour(x1g, x2g, V, levels=20, colors="white", linewidths=0.4, alpha=0.3)
-    for poly_nodes in polygons:
-        coords = [vertex_dict[v] for v in poly_nodes]
+    for coords in polygons:
         xs = [c[0] for c in coords] + [coords[0][0]]
         ys = [c[1] for c in coords] + [coords[0][1]]
         ax.plot(xs, ys, "k-", linewidth=0.6, alpha=0.5)
@@ -154,6 +214,8 @@ def plot_verification(
 
 
 def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem):
+    if problem.state_dim != 2:
+        return
     x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
     x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
 
@@ -214,7 +276,7 @@ def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CEGIS loop for ReLU Lyapunov verification"
+        description="Verification loop for ReLU Lyapunov functions"
     )
     parser.add_argument(
         "problem_file",
@@ -234,8 +296,8 @@ def main():
     parser.add_argument(
         "--epsilon",
         type=float,
-        default=1e-4,
-        help="Skip counterexamples within this distance of origin",
+        default=1e-8,
+        help="Skip spatial counterexamples within this distance of origin",
     )
     parser.add_argument(
         "--cex-window",
@@ -250,6 +312,17 @@ def main():
         help="Override hidden layer size in the Lyapunov net",
     )
     parser.add_argument("--device", default="cpu", help="torch device (cpu or cuda)")
+    parser.add_argument(
+        "--early-exit",
+        action="store_true",
+        help="Stop verification after the first failing condition",
+    )
+    parser.add_argument(
+        "--hole",
+        type=float,
+        default=None,
+        help="Hole radius around origin for positivity check (default: problem default)",
+    )
     args = parser.parse_args()
 
     # ── Load problem ──────────────────────────────────────────────────────────
@@ -258,6 +331,11 @@ def main():
     if args.hidden_size is not None:
         kwargs["hidden_size"] = args.hidden_size
     problem = mod.make_problem(**kwargs)
+
+    if args.early_exit:
+        problem.early_exit = True
+    if args.hole is not None:
+        problem.hole = args.hole
 
     # ── Checkpoint dir ────────────────────────────────────────────────────────
     if args.checkpoint_dir is None:
@@ -283,6 +361,7 @@ def main():
         f"  retrain_lr={args.retrain_lr}  cex_weight={args.cex_weight}"
         f"  epsilon={args.epsilon}  cex_window={args.cex_window}"
         f"  max_iter={args.max_iterations}"
+        f"  early_exit={args.early_exit}  hole={problem.hole}"
     )
     print()
 
@@ -303,36 +382,32 @@ def main():
 
     # ── Initial verification ──────────────────────────────────────────────────
     problem.to("cpu")
-    counterexamples_raw, polygons, vertex_dict = full_method(problem)
-    counterexamples = [
-        p for p in counterexamples_raw if (p[0] ** 2 + p[1] ** 2) >= args.epsilon**2
-    ]
-    n_origin = len(counterexamples_raw) - len(counterexamples)
-    origin_note = f" ({n_origin} near-origin filtered)" if n_origin else ""
-    print(f"\nResult: {len(counterexamples)} counterexample(s){origin_note}.")
+    origin_cexs, spatial_cexs, polygons = _unpack_verify(problem.verify(), args.epsilon)
+    all_cexs = origin_cexs + spatial_cexs
+    _print_verify_summary(origin_cexs, spatial_cexs, label="Initial verification")
 
     plot_verification(
         checkpoint_dir,
         "initial_verification.png",
         problem,
-        counterexamples,
+        all_cexs,
         polygons,
-        vertex_dict,
         args.grid_pts,
         "Hyperplane verification: polygon tessellation + counterexamples",
     )
 
     # ── Build base grid for retraining ────────────────────────────────────────
-    x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
-    x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
-    x1_t = np.linspace(x1_min, x1_max, args.grid_pts)
-    x2_t = np.linspace(x2_min, x2_max, args.grid_pts)
-    x1g, x2g = np.meshgrid(x1_t, x2_t)
+    region_np = problem.region.numpy()
+    linspaces = [
+        np.linspace(region_np[d, 0], region_np[d, 1], args.grid_pts)
+        for d in range(problem.state_dim)
+    ]
+    mesh = np.meshgrid(*linspaces, indexing="ij")
     base_grid = torch.tensor(
-        np.stack([x1g.ravel(), x2g.ravel()], axis=1), dtype=torch.float32
+        np.stack([m.ravel() for m in mesh], axis=1), dtype=torch.float32
     )
 
-    # ── CEGIS loop ────────────────────────────────────────────────────────────
+    # ── Verification loop ────────────────────────────────────────────────────
     cex_history: list[list[tuple]] = []
     start_iteration = 0
 
@@ -348,20 +423,16 @@ def main():
     for i in range(start_iteration, args.max_iterations):
         start = time.time()
         problem.to("cpu")
-        counterexamples2, _, _ = full_method(problem)
-        print(f"Iteration {i}: {len(counterexamples2)} counterexample(s)")
+        origin_cexs, spatial_cexs, _ = _unpack_verify(problem.verify(), args.epsilon)
+        all_iter_cexs = origin_cexs + spatial_cexs
+        _print_verify_summary(origin_cexs, spatial_cexs, label=f"Iteration {i}")
+        cex_history.append(all_iter_cexs)
 
-        counterexamples2 = [
-            p for p in counterexamples2 if (p[0] ** 2 + p[1] ** 2) >= args.epsilon**2
-        ]
-        print(f"  {len(counterexamples2)} remain after filtering near-origin points.")
-        cex_history.append(counterexamples2)
-
-        if len(counterexamples2) == 0:
+        if len(all_iter_cexs) == 0:
             print("No counterexamples — done.")
             break
 
-        append_cex_log(cex_log, i, counterexamples2)
+        append_cex_log(cex_log, i, all_iter_cexs)
 
         # Sliding window
         window: list[tuple] = []
@@ -372,7 +443,7 @@ def main():
             f"(last {args.cex_window} iters)."
         )
 
-        cex_xy = [(p[0], p[1]) for p in window]
+        cex_xy = [p[:-1] for p in window]
         cex_tensor = torch.tensor(cex_xy, dtype=torch.float32)
         problem.to(device)
         grid_dev = base_grid.to(device)
@@ -414,13 +485,11 @@ def main():
 
     # ── Final verification ────────────────────────────────────────────────────
     problem.to("cpu")
-    final_cexs_raw, final_polygons, final_vertex_dict = full_method(problem)
-    final_cexs = [
-        p for p in final_cexs_raw if (p[0] ** 2 + p[1] ** 2) >= args.epsilon**2
-    ]
-    n_origin = len(final_cexs_raw) - len(final_cexs)
-    origin_note = f" ({n_origin} near-origin filtered)" if n_origin else ""
-    print(f"\nFinal verification: {len(final_cexs)} counterexample(s){origin_note}.")
+    origin_cexs, spatial_cexs, final_polygons = _unpack_verify(
+        problem.verify(), args.epsilon
+    )
+    final_cexs = origin_cexs + spatial_cexs
+    _print_verify_summary(origin_cexs, spatial_cexs, label="Final verification")
 
     plot_verification(
         checkpoint_dir,
@@ -428,7 +497,6 @@ def main():
         problem,
         final_cexs,
         final_polygons,
-        final_vertex_dict,
         args.grid_pts,
         "Final verification: polygon tessellation + counterexamples",
     )
