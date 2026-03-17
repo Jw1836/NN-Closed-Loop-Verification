@@ -113,6 +113,7 @@ class LyapunovProblem:
                 violations.append(np.append(c.interior_point, 0.0))
                 continue
 
+            # TODO: fix everything else in this function
             # Align polytope with the basis vector
             q1, _ = align_basis(c, grad)
 
@@ -122,8 +123,9 @@ class LyapunovProblem:
             x_t = torch.tensor(verts, dtype=torch.float32)
             with torch.no_grad():
                 f_verts = self.dynamics(x_t).numpy()
+            # TODO: apply correct rotation
             vdot_verts = f_verts @ q1  # shape (num_verts,)
-
+            # TODO: This check appears to be correct but let's double check
             max_idx = int(np.argmax(vdot_verts))
             if vdot_verts[max_idx] >= 0:
                 # Violation found at a vertex — no need for shgo
@@ -131,59 +133,60 @@ class LyapunovProblem:
                 continue
 
             # --- shgo for cells where vertices are all negative ---
-            # Get extremes of polytope to form rectangular bounds for shgo
-            bounds = np.column_stack(
-                [
-                    verts.min(axis=0),
-                    verts.max(axis=0),
-                ]
-            )
+            # TODO
+            # # Get extremes of polytope to form rectangular bounds for shgo
+            # bounds = np.column_stack(
+            #     [
+            #         verts.min(axis=0),
+            #         verts.max(axis=0),
+            #     ]
+            # )
 
-            # Halfspace constraints: each row of cell.halfspaces is [A_i | b_i]
-            # with A_i @ x + b_i <= 0.  scipy convention: g(x) >= 0.
-            A_hs = c.halfspaces[:, :-1]
-            b_hs = c.halfspaces[:, -1]
-            constraints = [
-                {"type": "ineq", "fun": lambda x, i=i: -(A_hs[i] @ x + b_hs[i])}
-                for i in range(len(A_hs))
-            ]
+            # # Halfspace constraints: each row of cell.halfspaces is [A_i | b_i]
+            # # with A_i @ x + b_i <= 0.  scipy convention: g(x) >= 0.
+            # A_hs = c.halfspaces[:, :-1]
+            # b_hs = c.halfspaces[:, -1]
+            # constraints = [
+            #     {"type": "ineq", "fun": lambda x, i=i: -(A_hs[i] @ x + b_hs[i])}
+            #     for i in range(len(A_hs))
+            # ]
 
-            # In the rotated frame, V_dot = ||grad|| * q1 @ f(x),
-            # so V_dot >= 0 iff q1 @ f(x) >= 0.
-            # The hard part is that f(x) is nonlinear
-            def obj(x_np: np.ndarray):
-                """MAX the product of q1·f(x) within the polytope."""
-                x = torch.tensor(x_np, dtype=torch.float32).unsqueeze(0)
-                with torch.no_grad():
-                    val = self.dynamics(x).squeeze().numpy()
-                return -(q1 @ val)  # Negate because shgo minimizes
+            # # In the rotated frame, V_dot = ||grad|| * q1 @ f(x),
+            # # so V_dot >= 0 iff q1 @ f(x) >= 0.
+            # # The hard part is that f(x) is nonlinear
+            # def obj(x_np: np.ndarray):
+            #     """MAX the product of q1·f(x) within the polytope."""
+            #     x = torch.tensor(x_np, dtype=torch.float32).unsqueeze(0)
+            #     with torch.no_grad():
+            #         val = self.dynamics(x).squeeze().numpy()
+            #     return -(q1 @ val)  # Negate because shgo minimizes
 
-            def callback(x):
-                # Diagnostic only
-                # print(x)
-                pass
+            # def callback(x):
+            #     # Diagnostic only
+            #     # print(x)
+            #     pass
 
-            # Run the optimization. See docstring for details.
-            # f_min=0: stop early once a negative value (violation) is found.
-            # Suppress shgo's warning when the actual minimum overshoots f_min.
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore", message="A much lower value", category=UserWarning
-                )
-                result: OptimizeResult = shgo(
-                    obj,
-                    bounds=bounds.tolist(),
-                    constraints=constraints,
-                    sampling_method="simplicial",
-                    options={"f_min": 0.0, "minimize_every_iter": True},
-                    callback=callback,
-                )
-            if not result.success:
-                raise RuntimeError(f"shgo failed on cell: {result.message}")
+            # # Run the optimization. See docstring for details.
+            # # f_min=0: stop early once a negative value (violation) is found.
+            # # Suppress shgo's warning when the actual minimum overshoots f_min.
+            # with warnings.catch_warnings():
+            #     warnings.filterwarnings(
+            #         "ignore", message="A much lower value", category=UserWarning
+            #     )
+            #     result: OptimizeResult = shgo(
+            #         obj,
+            #         bounds=bounds.tolist(),
+            #         constraints=constraints,
+            #         sampling_method="simplicial",
+            #         options={"f_min": 0.0, "minimize_every_iter": True},
+            #         callback=callback,
+            #     )
+            # if not result.success:
+            #     raise RuntimeError(f"shgo failed on cell: {result.message}")
 
-            # result.fun = min of -(q1·f(x)), so violation when result.fun < 0
-            if result.fun < 0.0:
-                violations.append(np.append(result.x, -result.fun))
+            # # result.fun = min of -(q1·f(x)), so violation when result.fun < 0
+            # if result.fun < 0.0:
+            #     violations.append(np.append(result.x, -result.fun))
 
         return None if not violations else np.vstack(violations)
 
