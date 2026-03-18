@@ -323,46 +323,43 @@ def verify_point(
 # ── Cell functions ───────────────────────────────────────────────
 
 
-def align_basis(
-    cell: HalfspaceIntersection,
-    gradient: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Rotate cell vertices so that *gradient* aligns with E_1, matrix-free.
+def align_basis(gradient: np.ndarray) -> np.ndarray:
+    """First row of the Householder reflection mapping *gradient* to basis e1: ``+||g||·e₁``, matrix-free.
 
-    Uses a Householder reflection Q = I - 2 v v^T / (v^T v) with
-    v = g_hat - e_1, giving Q @ g_hat = +e_1.  The full matrix is never
-    formed; vertices are rotated via the rank-1 update and Q's first row
-    is returned as a vector for downstream rf1 computation.
-
-    Parameters
-    ----------
-    cell : HalfspaceIntersection
-        Polytope whose vertices are stored in ``cell.intersections``.
-    gradient : ndarray, shape (n,) or (n, 1)
-        Non-zero gradient of the Lyapunov function in this cell.
-
-    Returns
-    -------
-    q1 : ndarray, shape (n,)
-        First row of Q.  ``q1 @ f`` gives the rotated first component of f.
-    rotated_vertices : ndarray, shape (num_intersections, n)
-        ``cell.intersections`` after applying Q.
+    Algorithm 5.1.1 from Golub & Van Loan, *Matrix Computations* 4th ed,
+    adapted for a single reflection (no ``v(1)=1`` normalization or packed storage).
     """
     g = np.asarray(gradient, dtype=float).flatten()
-    g_norm = np.linalg.norm(g)
-    if g_norm < 1e-10:
+    n = g.shape[0]
+    mu = np.linalg.norm(g)  # textbook: mu = ||x||
+    if mu < 1e-10:
         raise ValueError("Gradient is zero; cannot align basis.")
-    e_1 = np.zeros_like(g)
-    e_1[0] = 1.0
-    v = g - g_norm * e_1
-    H = np.eye(len(g)) - 2 * np.outer(v, v) / np.dot(v, v)
-    #make sure the this correctly rotates g to be in line with e_1
-    #exit early if it fails, since the rest of the code relies on this being correct
-    if not np.allclose(H @ g, g_norm * e_1, atol=1e-10):
-        raise SystemExit("Householder reflection failed to align gradient")
-    q1 = H[0, :] # first row of H
-    return q1, None
 
+    e_1 = np.zeros(n)
+    e_1[0] = 1.0
+
+    sigma = np.dot(g[1:], g[1:])  # textbook: sigma = x(2:m)^T x(2:m)
+
+    # Householder vector v: only v[0] differs from g, v[1:] = g[1:]
+    v = g.copy()
+    if sigma < 1e-10:
+        if g[0] >= 0:
+            return e_1.copy()  # already along +e_1, Q = I
+        else:
+            v[0] = g[0] - mu  # along -e_1, no cancellation
+    elif g[0] <= 0:
+        v[0] = g[0] - mu  # no cancellation: both terms same sign
+    else:
+        v[0] = -sigma / (g[0] + mu)  # avoids cancellation when g[0] > 0
+
+    # beta = 2/(v^T v); textbook folds this into a normalized v(1)=1 form we don't need
+    vtv = np.dot(v, v)
+    beta = 2.0 / vtv
+
+    # Only the first row of Q = I - beta*v*v^T is needed downstream
+    q1 = e_1 - (beta * v[0]) * v
+
+    return q1
 
 
 def contains_point(cell: HalfspaceIntersection, point: np.ndarray) -> bool:

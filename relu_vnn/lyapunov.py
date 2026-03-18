@@ -113,35 +113,36 @@ class LyapunovProblem:
                 violations.append(np.append(c.interior_point, 0.0))
                 continue
 
-            # TODO: fix everything else in this function
             # Align polytope with the basis vector
-            q1, _ = align_basis(c, grad)
+            q1 = align_basis(grad)
 
-            # Define the rotated dynamics: v_i_1 = q1 @ f(x)
-            # This is the function to maximize over the cell
+            # --- Batched vertex pre-check ---
+            # Evaluate dynamics at all vertices in one forward pass
+            x_t = torch.tensor(c.intersections, dtype=torch.float32)
+            with torch.no_grad():
+                f_verts = self.dynamics(x_t).numpy()
+            # Map to basis vector e1 to form indicator vector
+            v_i_f_verts = f_verts @ q1
+            # Any vector with a positive value in the first element is a counterexample,
+            # but we'll return the most-wrong one.
+            max_idx = int(np.argmax(v_i_f_verts))
+            if v_i_f_verts[max_idx] >= 0:
+                # Violation found at a vertex — no need for shgo
+                violations.append(
+                    np.append(c.intersections[max_idx], v_i_f_verts[max_idx])
+                )
+                continue
+
+            # --- shgo for cells where vertices are all negative ---
             def v_i_1(x):
-                """Rotated first component of dynamics: q1 @ f(x)."""
+                """Rotated first component of dynamics: v_i_1 = q1 @ f(x).
+                This is the function to MAX within a cell.
+                If it is ever positive: counterexample."""
                 x_tensor = torch.tensor(np.atleast_1d(x), dtype=torch.float32)
                 with torch.no_grad():
                     f_x = self.dynamics(x_tensor).numpy()
                 return float(q1 @ f_x)
 
-            # --- Batched vertex pre-check ---
-            # Evaluate dynamics at all vertices in one forward pass
-            verts = c.intersections
-            x_t = torch.tensor(verts, dtype=torch.float32)
-            with torch.no_grad():
-                f_verts = self.dynamics(x_t).numpy()
-            # TODO: apply correct rotation
-            vdot_verts = f_verts @ q1  # shape (num_verts,)
-            # TODO: This check appears to be correct but let's double check
-            max_idx = int(np.argmax(vdot_verts))
-            if vdot_verts[max_idx] >= 0:
-                # Violation found at a vertex — no need for shgo
-                violations.append(np.append(verts[max_idx], vdot_verts[max_idx]))
-                continue
-
-            # --- shgo for cells where vertices are all negative ---
             # TODO
             # # Get extremes of polytope to form rectangular bounds for shgo
             # bounds = np.column_stack(

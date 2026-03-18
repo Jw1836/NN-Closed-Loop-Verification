@@ -2,47 +2,43 @@
 
 import numpy as np
 import pytest
-from scipy.spatial import ConvexHull, HalfspaceIntersection
 
 from relu_vnn.hyperplane import align_basis
 
 
-def _make_hs(vertices: np.ndarray) -> HalfspaceIntersection:
-    """Create a HalfspaceIntersection from a set of vertices."""
-    hull = ConvexHull(vertices)
-    interior = vertices.mean(axis=0)
-    return HalfspaceIntersection(hull.equations, interior)
+def _reference_q1(gradient: np.ndarray) -> np.ndarray:
+    """Reference first row via numpy QR on the gradient as a single column."""
+    g = np.asarray(gradient, dtype=float).flatten().reshape(-1, 1)
+    Q, R = np.linalg.qr(g, mode="complete")
+    # QR may map g to -||g||*e1; correct sign so it maps to +||g||*e1
+    if R[0, 0] < 0:
+        Q = -Q
+    return Q[0, :]
 
 
 # ── 3-D ──────────────────────────────────────────────────────────────────────
 
 
 class TestAlignBasis3D:
-    """3-D: tetrahedron with various gradient directions."""
+    """3-D: various gradient directions."""
 
-    @pytest.fixture()
-    def tetrahedron(self):
-        verts = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=float)
-        return _make_hs(verts)
-
-    def test_gradient_along_e3(self, tetrahedron):
+    def test_gradient_along_e3(self):
         """Gradient along e_3 — q1 should pick out the z component."""
-        q1, _ = align_basis(tetrahedron, np.array([0.0, 0.0, 2.0]))
+        q1 = align_basis(np.array([0.0, 0.0, 2.0]))
         np.testing.assert_allclose(q1 @ np.array([0, 0, 1]), 1.0, atol=1e-12)
         np.testing.assert_allclose(q1 @ np.array([1, 0, 0]), 0.0, atol=1e-12)
         np.testing.assert_allclose(q1 @ np.array([0, 1, 0]), 0.0, atol=1e-12)
 
-    def test_negative_e1(self, tetrahedron):
+    def test_negative_e1(self):
         """Gradient along -e_1 — should flip sign."""
-        q1, _ = align_basis(tetrahedron, np.array([-3.0, 0.0, 0.0]))
+        q1 = align_basis(np.array([-3.0, 0.0, 0.0]))
         np.testing.assert_allclose(q1, [-1, 0, 0], atol=1e-12)
 
-    def test_preserves_volume(self, tetrahedron):
+    def test_matches_qr_reference(self):
         grad = np.array([1.0, 2.0, -3.0])
-        _, rv = align_basis(tetrahedron, grad)
-        orig_vol = ConvexHull(tetrahedron.intersections).volume
-        rot_hull = ConvexHull(rv)
-        np.testing.assert_allclose(rot_hull.volume, orig_vol, atol=1e-12)
+        q1 = align_basis(grad)
+        ref_q1 = _reference_q1(grad)
+        np.testing.assert_allclose(q1, ref_q1, atol=1e-12)
 
 
 # ── 2-D ──────────────────────────────────────────────────────────────────────
@@ -51,42 +47,33 @@ class TestAlignBasis3D:
 class TestAlignBasis2D:
     """2-D: compare against known rotation matrix."""
 
-    @pytest.fixture()
-    def square(self):
-        return _make_hs(np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=float))
-
-    def test_gradient_along_e1(self, square):
-        """Gradient already along e_1 — identity rotation, rv == intersections."""
-        q1, rv = align_basis(square, np.array([2.0, 0.0]))
+    def test_gradient_along_e1(self):
+        """Gradient already along e_1 — identity rotation."""
+        q1 = align_basis(np.array([2.0, 0.0]))
         np.testing.assert_allclose(q1, [1.0, 0.0], atol=1e-12)
-        np.testing.assert_allclose(rv, square.intersections, atol=1e-12)
 
-    def test_gradient_along_e2(self, square):
+    def test_gradient_along_e2(self):
         """Gradient along e_2 — 90-degree rotation."""
-        q1, rv = align_basis(square, np.array([0.0, 1.0]))
-        # q1 should map e_2 direction to positive first component
+        q1 = align_basis(np.array([0.0, 1.0]))
         np.testing.assert_allclose(q1 @ np.array([0.0, 1.0]), 1.0, atol=1e-12)
         np.testing.assert_allclose(q1 @ np.array([1.0, 0.0]), 0.0, atol=1e-12)
 
-    def test_diagonal_gradient(self, square):
+    def test_diagonal_gradient(self):
         grad = np.array([1.0, 1.0])
-        q1, rv = align_basis(square, grad)
-        # q1 @ grad_hat should equal 1 (mapped to e_1)
+        q1 = align_basis(grad)
         g_hat = grad / np.linalg.norm(grad)
         np.testing.assert_allclose(q1 @ g_hat, 1.0, atol=1e-12)
 
-    def test_rotated_vertices_preserve_distances(self, square):
-        """Householder is orthogonal, so pairwise distances are preserved."""
+    def test_matches_qr_reference(self):
+        """q1 should match the first row from numpy QR."""
         grad = np.array([3.0, -4.0])
-        _, rv = align_basis(square, grad)
-        verts = square.intersections
-        orig_dists = np.linalg.norm(verts[:, None] - verts[None, :], axis=-1)
-        rot_dists = np.linalg.norm(rv[:, None] - rv[None, :], axis=-1)
-        np.testing.assert_allclose(rot_dists, orig_dists, atol=1e-12)
+        q1 = align_basis(grad)
+        ref_q1 = _reference_q1(grad)
+        np.testing.assert_allclose(q1, ref_q1, atol=1e-12)
 
-    def test_column_input(self, square):
+    def test_column_input(self):
         """Gradient passed as (2, 1) column vector should work."""
-        q1, _ = align_basis(square, np.array([[0.0], [1.0]]))
+        q1 = align_basis(np.array([[0.0], [1.0]]))
         np.testing.assert_allclose(q1 @ np.array([0.0, 1.0]), 1.0, atol=1e-12)
 
 
@@ -96,49 +83,39 @@ class TestAlignBasis2D:
 class TestAlignBasis5D:
     """5-D: verify properties that must hold in any dimension."""
 
-    @pytest.fixture()
-    def simplex_5d(self):
-        """A 5-D simplex (6 vertices)."""
-        verts = np.eye(5) * 2.0
-        verts = np.vstack([verts, np.zeros(5)])
-        return _make_hs(verts)
-
-    def test_q1_maps_gradient_to_e1(self, simplex_5d):
+    def test_q1_maps_gradient_to_e1(self):
         rng = np.random.default_rng(42)
         grad = rng.standard_normal(5)
-        q1, _ = align_basis(simplex_5d, grad)
+        q1 = align_basis(grad)
         g_hat = grad / np.linalg.norm(grad)
         np.testing.assert_allclose(q1 @ g_hat, 1.0, atol=1e-12)
 
-    def test_q1_is_unit_vector(self, simplex_5d):
+    def test_q1_is_unit_vector(self):
         rng = np.random.default_rng(99)
         grad = rng.standard_normal(5)
-        q1, _ = align_basis(simplex_5d, grad)
+        q1 = align_basis(grad)
         np.testing.assert_allclose(np.linalg.norm(q1), 1.0, atol=1e-12)
 
-    def test_preserves_pairwise_distances(self, simplex_5d):
+    def test_matches_qr_reference(self):
+        """q1 should match numpy QR for random gradients."""
         rng = np.random.default_rng(7)
         grad = rng.standard_normal(5)
-        _, rv = align_basis(simplex_5d, grad)
-        verts = simplex_5d.intersections
-        orig_dists = np.linalg.norm(verts[:, None] - verts[None, :], axis=-1)
-        rot_dists = np.linalg.norm(rv[:, None] - rv[None, :], axis=-1)
-        np.testing.assert_allclose(rot_dists, orig_dists, atol=1e-12)
+        q1 = align_basis(grad)
+        ref_q1 = _reference_q1(grad)
+        np.testing.assert_allclose(q1, ref_q1, atol=1e-12)
 
-    def test_q1_orthogonal_to_complement(self, simplex_5d):
+    def test_q1_orthogonal_to_complement(self):
         """q1 · v_perp = 0 for any v perpendicular to gradient."""
         rng = np.random.default_rng(123)
         grad = rng.standard_normal(5)
-        q1, _ = align_basis(simplex_5d, grad)
+        q1 = align_basis(grad)
         g_hat = grad / np.linalg.norm(grad)
-        # Build a random vector, project out gradient component
         w = rng.standard_normal(5)
         w_perp = w - np.dot(w, g_hat) * g_hat
-        # Householder maps g_hat→e1, so vectors ⊥ g_hat stay ⊥ e1, meaning q1·w_perp = 0
         np.testing.assert_allclose(q1 @ w_perp, 0.0, atol=1e-12)
 
-    def test_gradient_near_e1(self, simplex_5d):
+    def test_gradient_near_e1(self):
         """Gradient nearly aligned with e_1 — should hit the early-return branch."""
         grad = np.array([1.0, 1e-16, 0.0, 0.0, 0.0])
-        q1, rv = align_basis(simplex_5d, grad)
+        q1 = align_basis(grad)
         np.testing.assert_allclose(q1, [1, 0, 0, 0, 0], atol=1e-10)
