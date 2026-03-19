@@ -1,6 +1,7 @@
 """Defines the LyapunovProblem dataclass — the common interface
 that verifiers and the Lyapunov network are handed."""
 
+import multiprocessing as mp
 import time
 import warnings
 
@@ -10,6 +11,160 @@ from torch import nn, Tensor
 from scipy.spatial import HalfspaceIntersection
 
 from relu_vnn.hyperplane import EPS
+
+
+def _check_cell_lie(args):
+    """Module-level worker for per-cell Lie derivative check.
+
+    Must be top-level for pickling with multiprocessing.
+    Each worker gets its own copy of the dynamics model so autograd
+    is thread/process-safe.
+    """
+    from .hyperplane import align_basis, analytic_gradient
+    from scipy.optimize import shgo, OptimizeResult
+
+    (
+        cell,
+        cell_idx,
+        n_cells,
+        W_matrix,
+        B_vector,
+        W_out_vec,
+        dynamics,
+        hole,
+        early_exit,
+    ) = args
+
+    t0 = time.perf_counter()
+    verts = cell.intersections
+    bounds = np.column_stack([verts.min(axis=0), verts.max(axis=0)])
+    bounds_str = "  ".join(
+        f"x{i}:[{bounds[i, 0]:.3g},{bounds[i, 1]:.3g}]" for i in range(bounds.shape[0])
+    )
+
+    ## Gradient alignment and quick check
+
+    grad = analytic_gradient(W_matrix, B_vector, W_out_vec, cell.interior_point)
+    grad_norm = float(np.linalg.norm(grad))
+
+    if grad_norm < EPS:
+        # Zero gradient is a violation
+        elapsed = time.perf_counter() - t0
+        return {
+            "cell_idx": cell_idx,
+            "outcome": "zero_grad",
+            "violations": [np.append(cell.interior_point, 0.0)],
+            "bounds": bounds,
+            "grad_norm": 0.0,
+            "v_dot_max": 0.0,
+            "elapsed": elapsed,
+            "bounds_str": bounds_str,
+            "n_pts": 1,
+        }
+
+    q1 = align_basis(grad)
+
+    # Fast and easy pre-check just at vertices and interior point before solver
+    check_pts = np.vstack([verts, cell.interior_point[np.newaxis]])
+    x_t = torch.tensor(check_pts, dtype=torch.float32)
+    with torch.no_grad():
+        f_check = dynamics(x_t).numpy()
+    v_i_check = f_check @ q1
+    violating_mask = v_i_check >= 0
+    if np.any(violating_mask):
+        elapsed = time.perf_counter() - t0
+        v_dot_max = float(np.max(v_i_check[violating_mask]))
+        n_pts = int(np.sum(violating_mask))
+        viols = [
+            np.append(check_pts[idx], float(v_i_check[idx]))
+            for idx in np.where(violating_mask)[0]
+        ]
+        return {
+            "cell_idx": cell_idx,
+            "outcome": "pre-check_violation",
+            "violations": viols,
+            "bounds": bounds,
+            "grad_norm": grad_norm,
+            "v_dot_max": v_dot_max,
+            "elapsed": elapsed,
+            "bounds_str": bounds_str,
+            "n_pts": n_pts,
+        }
+
+    ## shgo global optimization
+
+    # Pass convex polytope constraints to minimizer
+    A_hs = np.asarray(cell.halfspaces[:, :-1], dtype=np.float64)
+    b_hs = np.asarray(cell.halfspaces[:, -1], dtype=np.float64)
+    constraints = {
+        "type": "ineq",
+        "fun": lambda x: -A_hs @ x - b_hs,
+        "jac": lambda _x: -A_hs,
+    }
+
+    q1_tensor = torch.tensor(q1, dtype=torch.float32)
+
+    def v_i_1(x_np):
+        """The indicator vector is the function to MAX and check for positivity;
+        keep in mind that shgo solves the MIN."""
+        x = torch.tensor(np.atleast_1d(x_np), dtype=torch.float32).requires_grad_(True)
+        val = -(dynamics(x.unsqueeze(0)).squeeze(0) @ q1_tensor)
+        val.backward()
+        return val.detach().item(), np.asarray(x.grad, dtype=np.float64)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="A much lower value", category=UserWarning
+        )
+        result: OptimizeResult = shgo(
+            v_i_1,
+            bounds=bounds.tolist(),
+            constraints=constraints,
+            sampling_method="simplicial",
+            options={"minimize_every_iter": True, "maxiter": 20}
+            | ({"f_min": 0.0} if early_exit else {}),
+            minimizer_kwargs={"method": "SLSQP", "jac": True},
+        )
+
+    if not result.success and "feasible minimizer" not in (result.message or ""):
+        raise RuntimeError(f"shgo failed on cell: {result.message}")
+
+    elapsed = time.perf_counter() - t0
+
+    if result.success and result.fun < 0.0:
+        v_dot_max = float(-result.fun)
+        viols = []
+        xl = getattr(result, "xl", None)
+        funl = getattr(result, "funl", None)
+        if xl is not None and funl is not None:
+            for xi, fi in zip(np.atleast_2d(xl), np.atleast_1d(funl)):
+                if fi < 0.0:
+                    viols.append(np.append(xi, float(-fi)))
+        else:
+            viols.append(np.append(result.x, v_dot_max))
+        return {
+            "cell_idx": cell_idx,
+            "outcome": "shgo_violation",
+            "violations": viols,
+            "bounds": bounds,
+            "grad_norm": grad_norm,
+            "v_dot_max": v_dot_max,
+            "elapsed": elapsed,
+            "bounds_str": bounds_str,
+            "n_pts": len(viols),
+        }
+    else:
+        return {
+            "cell_idx": cell_idx,
+            "outcome": "shgo_certified",
+            "violations": [],
+            "bounds": bounds,
+            "grad_norm": grad_norm,
+            "v_dot_max": float(-result.fun),
+            "elapsed": elapsed,
+            "bounds_str": bounds_str,
+            "n_pts": 0,
+        }
 
 
 class LyapunovProblem:
@@ -22,12 +177,14 @@ class LyapunovProblem:
         nn_lyapunov: nn.Module,
         dynamics: nn.Module,
         region: Tensor,
+        n_workers: int = 1,
     ) -> None:
         self.nn_lyapunov = nn_lyapunov
         self.dynamics = dynamics
         self.region = region
         self.hole: float = EPS  # Hole around origin for numerical stability
         self.early_exit: bool = False
+        self.n_workers: int = n_workers
 
     @property
     def state_dim(self) -> int:
@@ -112,191 +269,88 @@ class LyapunovProblem:
         Returns None if the condition holds, or a 2-D array with each row
         [x1, x2, V_dot] indicating a violation.
         """
-        from .hyperplane import (
-            align_basis,
-            analytic_gradient,
-            extract_weights,
-        )
-        from scipy.optimize import shgo, OptimizeResult
+        from .hyperplane import extract_weights
 
         W_matrix, B_vector, W_out_vec = extract_weights(self.nn_lyapunov)
-        violations: list[np.ndarray] = []
         n_cells = len(cells)
+
+        # Build args for the worker function.  Dynamics is moved to CPU
+        # and each worker gets its own copy (autograd needs per-process state).
+        dynamics_cpu = self.dynamics.cpu()
+        args_list = [
+            (
+                c,
+                i,
+                n_cells,
+                W_matrix,
+                B_vector,
+                W_out_vec,
+                dynamics_cpu,
+                self.hole,
+                self.early_exit,
+            )
+            for i, c in enumerate(cells)
+        ]
+
+        if self.n_workers > 1:
+            ctx = mp.get_context("forkserver")
+            with ctx.Pool(self.n_workers) as pool:
+                results = pool.map(_check_cell_lie, args_list)
+        else:
+            results = [_check_cell_lie(a) for a in args_list]
+
+        # Move dynamics back to the original device
+        self.dynamics.to(self.device)
+
+        # Aggregate results and print (preserves original output order)
+        violations: list[np.ndarray] = []
         n_certified = 0
         n_violated = 0
 
-        for cell_idx, c in enumerate(cells):
-            t0 = time.perf_counter()
-            verts = c.intersections
-            bounds = np.column_stack([verts.min(axis=0), verts.max(axis=0)])
-            bounds_str = "  ".join(
-                f"x{i}:[{bounds[i, 0]:.3g},{bounds[i, 1]:.3g}]"
-                for i in range(bounds.shape[0])
-            )
+        for r in results:
+            cell_idx = r["cell_idx"]
+            outcome = r["outcome"]
+            bounds_str = r["bounds_str"]
+            elapsed = r["elapsed"]
 
-            # Calculate cell's gradient at interior point
-            grad = analytic_gradient(W_matrix, B_vector, W_out_vec, c.interior_point)
-            grad_norm = float(np.linalg.norm(grad))
-
-            # If gradient is zero, V_dot = 0 everywhere in cell, means counterexample
-            if grad_norm < EPS:
-                elapsed = time.perf_counter() - t0
-                n_violated += 1
-                print(
-                    f"[{cell_idx + 1}/{n_cells}] zero-grad violation  {bounds_str}"
-                    f"  ({elapsed:.3f}s)"
-                )
-                violations.append(np.append(c.interior_point, 0.0))
-                if callback is not None:
-                    callback(
-                        cell_idx,
-                        n_cells,
-                        {
-                            "bounds": bounds,
-                            "grad_norm": 0.0,
-                            "outcome": "zero_grad",
-                            "v_dot_max": 0.0,
-                            "elapsed": elapsed,
-                        },
-                    )
-                continue
-
-            # Align polytope with the basis vector
-            q1 = align_basis(grad)
-
-            # --- Batched vertex + interior point pre-check ---
-            check_pts = np.vstack([verts, c.interior_point[np.newaxis]])
-            x_t = torch.tensor(check_pts, dtype=torch.float32)
-            with torch.no_grad():
-                f_check = self.dynamics(x_t).numpy()
-            v_i_check = f_check @ q1
-            violating_mask = v_i_check >= 0
-            if np.any(violating_mask):
-                elapsed = time.perf_counter() - t0
-                v_dot_max = float(np.max(v_i_check[violating_mask]))
-                n_violated += 1
-                n_pts = int(np.sum(violating_mask))
-                print(
-                    f"[{cell_idx + 1}/{n_cells}] pre-check violation  {bounds_str}"
-                    f"  v_dot_max={v_dot_max:.4g}  ({n_pts} pts)  ({elapsed:.3f}s)"
-                )
-                for idx in np.where(violating_mask)[0]:
-                    violations.append(np.append(check_pts[idx], float(v_i_check[idx])))
-                if callback is not None:
-                    callback(
-                        cell_idx,
-                        n_cells,
-                        {
-                            "bounds": bounds,
-                            "grad_norm": grad_norm,
-                            "outcome": "pre-check_violation",
-                            "v_dot_max": v_dot_max,
-                            "elapsed": elapsed,
-                        },
-                    )
-                continue
-
-            # --- shgo for cells where vertices are all negative ---
-            # Halfspace constraints: each row of cell.halfspaces is [A_i | b_i]
-            # with A_i @ x + b_i <= 0.  scipy convention: g(x) >= 0.
-            A_hs = np.asarray(c.halfspaces[:, :-1], dtype=np.float64)
-            b_hs = np.asarray(c.halfspaces[:, -1], dtype=np.float64)
-
-            # SLSQP constraints: -A_hs @ x - b_hs >= 0 (vectorized)
-            constraints = {
-                "type": "ineq",
-                "fun": lambda x: -A_hs @ x - b_hs,
-                "jac": lambda _x: -A_hs,
-            }
-
-            q1_tensor = torch.tensor(q1, dtype=torch.float32)
-
-            def v_i_1(x_np: np.ndarray) -> tuple[float, np.ndarray]:
-                """Negated v_i_1 with gradient via autograd.
-                Returns (value, grad), as expected by shgo with jac=True.
-                """
-                x_t = torch.tensor(
-                    np.atleast_1d(x_np), dtype=torch.float32
-                ).requires_grad_(True)
-                val = -(self.dynamics(x_t.unsqueeze(0)).squeeze(0) @ q1_tensor)
-                val.backward()
-                return val.detach().item(), np.asarray(x_t.grad, dtype=np.float64)  # type: ignore[union-attr]
-
-            # shgo minimizes v_i_1; f_min=0 stops early on finding a violation.
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore", message="A much lower value", category=UserWarning
-                )
-                result: OptimizeResult = shgo(
-                    v_i_1,
-                    bounds=bounds.tolist(),
-                    constraints=constraints,
-                    sampling_method="simplicial",
-                    options={"minimize_every_iter": True, "maxiter": 20},
-                    minimizer_kwargs={
-                        "method": "SLSQP",
-                        "jac": True,
-                    },
-                )
-            # With f_min=0, shgo reports failure when min stays >= 0 (safe cell)
-            # because it never found a point below f_min.
-            if not result.success and "feasible minimizer" not in (
-                result.message or ""
-            ):
-                raise RuntimeError(f"shgo failed on cell: {result.message}")
-
-            elapsed = time.perf_counter() - t0
-            # result.fun = min of -(q1·f(x)), so violation when result.fun < 0
-            if result.success and result.fun < 0.0:
-                v_dot_max = float(-result.fun)
-                n_violated += 1
-                # Collect all local minima that are violations
-                xl = getattr(result, "xl", None)
-                funl = getattr(result, "funl", None)
-                if xl is not None and funl is not None:
-                    n_pts = 0
-                    for xi, fi in zip(np.atleast_2d(xl), np.atleast_1d(funl)):
-                        if fi < 0.0:
-                            violations.append(np.append(xi, float(-fi)))
-                            n_pts += 1
-                else:
-                    violations.append(np.append(result.x, v_dot_max))
-                    n_pts = 1
-                print(
-                    f"[{cell_idx + 1}/{n_cells}] shgo violation  {bounds_str}"
-                    f"  v_dot_max={v_dot_max:.4g}  ({n_pts} pts)  ({elapsed:.3f}s)"
-                )
-                if callback is not None:
-                    callback(
-                        cell_idx,
-                        n_cells,
-                        {
-                            "bounds": bounds,
-                            "grad_norm": grad_norm,
-                            "outcome": "shgo_violation",
-                            "v_dot_max": v_dot_max,
-                            "elapsed": elapsed,
-                        },
-                    )
-                continue
-            else:
+            if outcome == "shgo_certified":
                 n_certified += 1
                 print(
                     f"[{cell_idx + 1}/{n_cells}] certified  {bounds_str}"
                     f"  ({elapsed:.3f}s)"
                 )
-                if callback is not None:
-                    callback(
-                        cell_idx,
-                        n_cells,
-                        {
-                            "bounds": bounds,
-                            "grad_norm": grad_norm,
-                            "outcome": "shgo_certified",
-                            "v_dot_max": float(-result.fun),
-                            "elapsed": elapsed,
-                        },
+            else:
+                n_violated += 1
+                if outcome == "zero_grad":
+                    print(
+                        f"[{cell_idx + 1}/{n_cells}] zero-grad violation  {bounds_str}"
+                        f"  ({elapsed:.3f}s)"
                     )
+                elif outcome == "pre-check_violation":
+                    print(
+                        f"[{cell_idx + 1}/{n_cells}] pre-check violation  {bounds_str}"
+                        f"  v_dot_max={r['v_dot_max']:.4g}  ({r['n_pts']} pts)  ({elapsed:.3f}s)"
+                    )
+                elif outcome == "shgo_violation":
+                    print(
+                        f"[{cell_idx + 1}/{n_cells}] shgo violation  {bounds_str}"
+                        f"  v_dot_max={r['v_dot_max']:.4g}  ({r['n_pts']} pts)  ({elapsed:.3f}s)"
+                    )
+
+            violations.extend(r["violations"])
+
+            if callback is not None:
+                callback(
+                    cell_idx,
+                    n_cells,
+                    {
+                        "bounds": r["bounds"],
+                        "grad_norm": r["grad_norm"],
+                        "outcome": outcome,
+                        "v_dot_max": r["v_dot_max"],
+                        "elapsed": elapsed,
+                    },
+                )
 
         print(
             f"check_decrease done: {n_certified}/{n_cells} certified, "

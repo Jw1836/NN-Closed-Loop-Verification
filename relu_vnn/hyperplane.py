@@ -118,7 +118,7 @@ def find_chebyshev_center(halfspaces: np.ndarray) -> np.ndarray | None:
         bounds=[(None, None)] * state_dim + [(0, None)],
         method="highs",
     )
-    if result.success and result.x[-1] > EPS:
+    if result.success and result.x[-1] > 0:
         return result.x[:state_dim]
     return None
 
@@ -132,10 +132,10 @@ def enumerate_cells_bfs(
     """Enumerate all non-empty cells of the ReLU hyperplane arrangement via BFS.
 
     Each hidden neuron defines a hyperplane ``w_i · x + b_i = 0`` that splits
-    the domain into two half-spaces.  A *cell* is the intersection of one
-    half-space per neuron (the "activation pattern") with the bounding box —
-    i.e. the region where a specific set of ReLUs are on/off.  Within each
-    cell the network is affine, so ``∇V`` is constant.
+    the domain into two half-spaces.  A *cell* is the convex polytope formed
+    by the intersection of one half-space per neuron (the "activation pattern")
+    with the bounding box — i.e. the region where a specific set of ReLUs are on/off.
+    Within each cell the network is affine, so ``∇V`` is constant.
 
     In 2-D with *n* hyperplanes there are at most ``O(n²)`` non-empty cells
     (arrangement complexity theorem), so BFS is tractable even though the
