@@ -54,7 +54,7 @@ class BilinearProblem(LyapunovProblem):
 
     def __init__(self, region: Tensor | None = None, hidden_size: int = 30):
         if region is None:
-            region = torch.tensor([[-1.0, 1.0], [-1.0, 1.0]])
+            region = torch.tensor([[-2.0, 2.0], [-2.0, 2.0]])
         super().__init__(
             nn_lyapunov=BilinearLyapunov(hidden_size=hidden_size),
             dynamics=BilinearDynamics(),

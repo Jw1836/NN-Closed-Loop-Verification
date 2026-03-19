@@ -9,6 +9,8 @@ import torch
 from torch import nn, Tensor
 from scipy.spatial import HalfspaceIntersection
 
+from relu_vnn.hyperplane import EPS
+
 
 class LyapunovProblem:
     """A NN Lyapunov function, dynamics, and region of interest.
@@ -24,7 +26,7 @@ class LyapunovProblem:
         self.nn_lyapunov = nn_lyapunov
         self.dynamics = dynamics
         self.region = region
-        self.hole: float = 1e-6  # Hole around origin for numerical stability
+        self.hole: float = EPS  # Hole around origin for numerical stability
         self.early_exit: bool = False
 
     @property
@@ -137,7 +139,7 @@ class LyapunovProblem:
             grad_norm = float(np.linalg.norm(grad))
 
             # If gradient is zero, V_dot = 0 everywhere in cell, means counterexample
-            if grad_norm < 1e-10:
+            if grad_norm < EPS:
                 elapsed = time.perf_counter() - t0
                 n_violated += 1
                 print(
@@ -168,16 +170,18 @@ class LyapunovProblem:
             with torch.no_grad():
                 f_check = self.dynamics(x_t).numpy()
             v_i_check = f_check @ q1
-            max_idx = int(np.argmax(v_i_check))
-            if v_i_check[max_idx] >= 0:
+            violating_mask = v_i_check >= 0
+            if np.any(violating_mask):
                 elapsed = time.perf_counter() - t0
-                v_dot_max = float(v_i_check[max_idx])
+                v_dot_max = float(np.max(v_i_check[violating_mask]))
                 n_violated += 1
+                n_pts = int(np.sum(violating_mask))
                 print(
                     f"[{cell_idx + 1}/{n_cells}] pre-check violation  {bounds_str}"
-                    f"  v_dot_max={v_dot_max:.4g}  ({elapsed:.3f}s)"
+                    f"  v_dot_max={v_dot_max:.4g}  ({n_pts} pts)  ({elapsed:.3f}s)"
                 )
-                violations.append(np.append(check_pts[max_idx], v_dot_max))
+                for idx in np.where(violating_mask)[0]:
+                    violations.append(np.append(check_pts[idx], float(v_i_check[idx])))
                 if callback is not None:
                     callback(
                         cell_idx,
@@ -228,25 +232,40 @@ class LyapunovProblem:
                     bounds=bounds.tolist(),
                     constraints=constraints,
                     sampling_method="simplicial",
-                    options={"f_min": 0.0, "minimize_every_iter": True, "maxiter": 20},
+                    options={"minimize_every_iter": True, "maxiter": 20},
                     minimizer_kwargs={
                         "method": "SLSQP",
                         "jac": True,
                     },
                 )
-            if not result.success:
+            # With f_min=0, shgo reports failure when min stays >= 0 (safe cell)
+            # because it never found a point below f_min.
+            if not result.success and "feasible minimizer" not in (
+                result.message or ""
+            ):
                 raise RuntimeError(f"shgo failed on cell: {result.message}")
 
             elapsed = time.perf_counter() - t0
             # result.fun = min of -(q1·f(x)), so violation when result.fun < 0
-            if result.fun < 0.0:
+            if result.success and result.fun < 0.0:
                 v_dot_max = float(-result.fun)
                 n_violated += 1
+                # Collect all local minima that are violations
+                xl = getattr(result, "xl", None)
+                funl = getattr(result, "funl", None)
+                if xl is not None and funl is not None:
+                    n_pts = 0
+                    for xi, fi in zip(np.atleast_2d(xl), np.atleast_1d(funl)):
+                        if fi < 0.0:
+                            violations.append(np.append(xi, float(-fi)))
+                            n_pts += 1
+                else:
+                    violations.append(np.append(result.x, v_dot_max))
+                    n_pts = 1
                 print(
                     f"[{cell_idx + 1}/{n_cells}] shgo violation  {bounds_str}"
-                    f"  v_dot_max={v_dot_max:.4g}  ({elapsed:.3f}s)"
+                    f"  v_dot_max={v_dot_max:.4g}  ({n_pts} pts)  ({elapsed:.3f}s)"
                 )
-                violations.append(np.append(result.x, v_dot_max))
                 if callback is not None:
                     callback(
                         cell_idx,
