@@ -9,6 +9,8 @@ import torch
 from torch import nn, Tensor
 from scipy.spatial import HalfspaceIntersection
 
+from relu_vnn.hyperplane import EPS
+
 
 class LyapunovProblem:
     """A NN Lyapunov function, dynamics, and region of interest.
@@ -24,7 +26,7 @@ class LyapunovProblem:
         self.nn_lyapunov = nn_lyapunov
         self.dynamics = dynamics
         self.region = region
-        self.hole: float = 1e-6  # Hole around origin for numerical stability
+        self.hole: float = EPS  # Hole around origin for numerical stability
         self.early_exit: bool = False
 
     @property
@@ -88,8 +90,24 @@ class LyapunovProblem:
 
         return cex
 
-    def check_decrease(self, cells: list[HalfspaceIntersection]) -> np.ndarray | None:
+    def check_decrease(
+        self,
+        cells: list[HalfspaceIntersection],
+        callback=None,
+    ) -> np.ndarray | None:
         """Check that ∇V(x)·f(x) < 0 everywhere except the origin (third Lyapunov condition).
+
+        Args:
+            cells:    Cell decomposition from enumerate_cells().
+            callback: Optional callable invoked after each cell with signature
+                        callback(cell_idx, total_cells, info)
+                      where *info* is a dict with keys:
+                        "bounds"     — np.ndarray shape (state_dim, 2), [min, max] per dim
+                        "grad_norm"  — float, ‖∇V‖ at the interior point
+                        "outcome"    — str: "zero_grad" | "pre-check_violation" |
+                                       "shgo_violation" | "shgo_certified"
+                        "v_dot_max"  — float, max V_dot found (positive = violation)
+                        "elapsed"    — float, seconds spent on this cell
 
         Returns None if the condition holds, or a 2-D array with each row
         [x1, x2, V_dot] indicating a violation.
@@ -103,91 +121,187 @@ class LyapunovProblem:
 
         W_matrix, B_vector, W_out_vec = extract_weights(self.nn_lyapunov)
         violations: list[np.ndarray] = []
+        n_cells = len(cells)
+        n_certified = 0
+        n_violated = 0
 
-        for c in cells:
+        for cell_idx, c in enumerate(cells):
+            t0 = time.perf_counter()
+            verts = c.intersections
+            bounds = np.column_stack([verts.min(axis=0), verts.max(axis=0)])
+            bounds_str = "  ".join(
+                f"x{i}:[{bounds[i, 0]:.3g},{bounds[i, 1]:.3g}]"
+                for i in range(bounds.shape[0])
+            )
+
             # Calculate cell's gradient at interior point
             grad = analytic_gradient(W_matrix, B_vector, W_out_vec, c.interior_point)
+            grad_norm = float(np.linalg.norm(grad))
 
             # If gradient is zero, V_dot = 0 everywhere in cell, means counterexample
-            if np.linalg.norm(grad) < 1e-10:
+            if grad_norm < EPS:
+                elapsed = time.perf_counter() - t0
+                n_violated += 1
+                print(
+                    f"[{cell_idx + 1}/{n_cells}] zero-grad violation  {bounds_str}"
+                    f"  ({elapsed:.3f}s)"
+                )
                 violations.append(np.append(c.interior_point, 0.0))
+                if callback is not None:
+                    callback(
+                        cell_idx,
+                        n_cells,
+                        {
+                            "bounds": bounds,
+                            "grad_norm": 0.0,
+                            "outcome": "zero_grad",
+                            "v_dot_max": 0.0,
+                            "elapsed": elapsed,
+                        },
+                    )
                 continue
 
-            # TODO: fix everything else in this function
             # Align polytope with the basis vector
-            q1, _ = align_basis(c, grad)
+            q1 = align_basis(grad)
 
-            # --- Batched vertex pre-check ---
-            # Evaluate dynamics at all vertices in one forward pass
-            verts = c.intersections
-            x_t = torch.tensor(verts, dtype=torch.float32)
+            # --- Batched vertex + interior point pre-check ---
+            check_pts = np.vstack([verts, c.interior_point[np.newaxis]])
+            x_t = torch.tensor(check_pts, dtype=torch.float32)
             with torch.no_grad():
-                f_verts = self.dynamics(x_t).numpy()
-            # TODO: apply correct rotation
-            vdot_verts = f_verts @ q1  # shape (num_verts,)
-            # TODO: This check appears to be correct but let's double check
-            max_idx = int(np.argmax(vdot_verts))
-            if vdot_verts[max_idx] >= 0:
-                # Violation found at a vertex — no need for shgo
-                violations.append(np.append(verts[max_idx], vdot_verts[max_idx]))
+                f_check = self.dynamics(x_t).numpy()
+            v_i_check = f_check @ q1
+            violating_mask = v_i_check >= 0
+            if np.any(violating_mask):
+                elapsed = time.perf_counter() - t0
+                v_dot_max = float(np.max(v_i_check[violating_mask]))
+                n_violated += 1
+                n_pts = int(np.sum(violating_mask))
+                print(
+                    f"[{cell_idx + 1}/{n_cells}] pre-check violation  {bounds_str}"
+                    f"  v_dot_max={v_dot_max:.4g}  ({n_pts} pts)  ({elapsed:.3f}s)"
+                )
+                for idx in np.where(violating_mask)[0]:
+                    violations.append(np.append(check_pts[idx], float(v_i_check[idx])))
+                if callback is not None:
+                    callback(
+                        cell_idx,
+                        n_cells,
+                        {
+                            "bounds": bounds,
+                            "grad_norm": grad_norm,
+                            "outcome": "pre-check_violation",
+                            "v_dot_max": v_dot_max,
+                            "elapsed": elapsed,
+                        },
+                    )
                 continue
 
             # --- shgo for cells where vertices are all negative ---
-            # TODO
-            # # Get extremes of polytope to form rectangular bounds for shgo
-            # bounds = np.column_stack(
-            #     [
-            #         verts.min(axis=0),
-            #         verts.max(axis=0),
-            #     ]
-            # )
+            # Halfspace constraints: each row of cell.halfspaces is [A_i | b_i]
+            # with A_i @ x + b_i <= 0.  scipy convention: g(x) >= 0.
+            A_hs = np.asarray(c.halfspaces[:, :-1], dtype=np.float64)
+            b_hs = np.asarray(c.halfspaces[:, -1], dtype=np.float64)
 
-            # # Halfspace constraints: each row of cell.halfspaces is [A_i | b_i]
-            # # with A_i @ x + b_i <= 0.  scipy convention: g(x) >= 0.
-            # A_hs = c.halfspaces[:, :-1]
-            # b_hs = c.halfspaces[:, -1]
-            # constraints = [
-            #     {"type": "ineq", "fun": lambda x, i=i: -(A_hs[i] @ x + b_hs[i])}
-            #     for i in range(len(A_hs))
-            # ]
+            # SLSQP constraints: -A_hs @ x - b_hs >= 0 (vectorized)
+            constraints = {
+                "type": "ineq",
+                "fun": lambda x: -A_hs @ x - b_hs,
+                "jac": lambda _x: -A_hs,
+            }
 
-            # # In the rotated frame, V_dot = ||grad|| * q1 @ f(x),
-            # # so V_dot >= 0 iff q1 @ f(x) >= 0.
-            # # The hard part is that f(x) is nonlinear
-            # def obj(x_np: np.ndarray):
-            #     """MAX the product of q1·f(x) within the polytope."""
-            #     x = torch.tensor(x_np, dtype=torch.float32).unsqueeze(0)
-            #     with torch.no_grad():
-            #         val = self.dynamics(x).squeeze().numpy()
-            #     return -(q1 @ val)  # Negate because shgo minimizes
+            q1_tensor = torch.tensor(q1, dtype=torch.float32)
 
-            # def callback(x):
-            #     # Diagnostic only
-            #     # print(x)
-            #     pass
+            def v_i_1(x_np: np.ndarray) -> tuple[float, np.ndarray]:
+                """Negated v_i_1 with gradient via autograd.
+                Returns (value, grad), as expected by shgo with jac=True.
+                """
+                x_t = torch.tensor(
+                    np.atleast_1d(x_np), dtype=torch.float32
+                ).requires_grad_(True)
+                val = -(self.dynamics(x_t.unsqueeze(0)).squeeze(0) @ q1_tensor)
+                val.backward()
+                return val.detach().item(), np.asarray(x_t.grad, dtype=np.float64)  # type: ignore[union-attr]
 
-            # # Run the optimization. See docstring for details.
-            # # f_min=0: stop early once a negative value (violation) is found.
-            # # Suppress shgo's warning when the actual minimum overshoots f_min.
-            # with warnings.catch_warnings():
-            #     warnings.filterwarnings(
-            #         "ignore", message="A much lower value", category=UserWarning
-            #     )
-            #     result: OptimizeResult = shgo(
-            #         obj,
-            #         bounds=bounds.tolist(),
-            #         constraints=constraints,
-            #         sampling_method="simplicial",
-            #         options={"f_min": 0.0, "minimize_every_iter": True},
-            #         callback=callback,
-            #     )
-            # if not result.success:
-            #     raise RuntimeError(f"shgo failed on cell: {result.message}")
+            # shgo minimizes v_i_1; f_min=0 stops early on finding a violation.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", message="A much lower value", category=UserWarning
+                )
+                result: OptimizeResult = shgo(
+                    v_i_1,
+                    bounds=bounds.tolist(),
+                    constraints=constraints,
+                    sampling_method="simplicial",
+                    options={"minimize_every_iter": True, "maxiter": 20},
+                    minimizer_kwargs={
+                        "method": "SLSQP",
+                        "jac": True,
+                    },
+                )
+            # With f_min=0, shgo reports failure when min stays >= 0 (safe cell)
+            # because it never found a point below f_min.
+            if not result.success and "feasible minimizer" not in (
+                result.message or ""
+            ):
+                raise RuntimeError(f"shgo failed on cell: {result.message}")
 
-            # # result.fun = min of -(q1·f(x)), so violation when result.fun < 0
-            # if result.fun < 0.0:
-            #     violations.append(np.append(result.x, -result.fun))
+            elapsed = time.perf_counter() - t0
+            # result.fun = min of -(q1·f(x)), so violation when result.fun < 0
+            if result.success and result.fun < 0.0:
+                v_dot_max = float(-result.fun)
+                n_violated += 1
+                # Collect all local minima that are violations
+                xl = getattr(result, "xl", None)
+                funl = getattr(result, "funl", None)
+                if xl is not None and funl is not None:
+                    n_pts = 0
+                    for xi, fi in zip(np.atleast_2d(xl), np.atleast_1d(funl)):
+                        if fi < 0.0:
+                            violations.append(np.append(xi, float(-fi)))
+                            n_pts += 1
+                else:
+                    violations.append(np.append(result.x, v_dot_max))
+                    n_pts = 1
+                print(
+                    f"[{cell_idx + 1}/{n_cells}] shgo violation  {bounds_str}"
+                    f"  v_dot_max={v_dot_max:.4g}  ({n_pts} pts)  ({elapsed:.3f}s)"
+                )
+                if callback is not None:
+                    callback(
+                        cell_idx,
+                        n_cells,
+                        {
+                            "bounds": bounds,
+                            "grad_norm": grad_norm,
+                            "outcome": "shgo_violation",
+                            "v_dot_max": v_dot_max,
+                            "elapsed": elapsed,
+                        },
+                    )
+                continue
+            else:
+                n_certified += 1
+                print(
+                    f"[{cell_idx + 1}/{n_cells}] certified  {bounds_str}"
+                    f"  ({elapsed:.3f}s)"
+                )
+                if callback is not None:
+                    callback(
+                        cell_idx,
+                        n_cells,
+                        {
+                            "bounds": bounds,
+                            "grad_norm": grad_norm,
+                            "outcome": "shgo_certified",
+                            "v_dot_max": float(-result.fun),
+                            "elapsed": elapsed,
+                        },
+                    )
 
+        print(
+            f"check_decrease done: {n_certified}/{n_cells} certified, "
+            f"{n_violated}/{n_cells} violated"
+        )
         return None if not violations else np.vstack(violations)
 
     def enumerate_cells(self) -> list[HalfspaceIntersection]:

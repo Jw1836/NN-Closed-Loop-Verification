@@ -17,6 +17,9 @@ from scipy.spatial import HalfspaceIntersection
 from typing import Sequence, cast
 from torch import nn
 
+# float32 numerical tolerance (~10× machine epsilon)
+EPS: float = 1e-6
+
 # Type aliases
 ActivationPattern = tuple[bool, ...]
 Vertex2D = Sequence[float] | np.ndarray  # (x1, x2)
@@ -115,7 +118,7 @@ def find_chebyshev_center(halfspaces: np.ndarray) -> np.ndarray | None:
         bounds=[(None, None)] * state_dim + [(0, None)],
         method="highs",
     )
-    if result.success and result.x[-1] > 1e-10:
+    if result.success and result.x[-1] > EPS:
         return result.x[:state_dim]
     return None
 
@@ -173,7 +176,7 @@ def enumerate_cells_bfs(
         # Fast path: the hint (reflected interior of the parent cell) is often
         # already strictly feasible, saving an LP solve.
         hint_violations = hs[:, :-1] @ hint + hs[:, -1]
-        if np.all(hint_violations < -1e-10):
+        if np.all(hint_violations < -EPS):
             interior = hint
         else:
             # Slow path: solve the Chebyshev-center LP for the largest
@@ -215,7 +218,7 @@ def enumerate_cells_bfs(
         # Vectorized: evaluate all n hyperplanes at all k vertices at once.
         ordered_verts = raw_verts[hull.vertices]
         all_values = ordered_verts @ W_matrix + B_vector  # (k, n_hidden)
-        tight_mask = np.any(np.abs(all_values) < 1e-6, axis=0)  # (n_hidden,)
+        tight_mask = np.any(np.abs(all_values) < EPS, axis=0)  # (n_hidden,)
 
         for i in np.where(tight_mask)[0]:
             # Flip bit i to get the neighbor's activation pattern
@@ -323,57 +326,43 @@ def verify_point(
 # ── Cell functions ───────────────────────────────────────────────
 
 
-def align_basis(
-    cell: HalfspaceIntersection,
-    gradient: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Rotate cell vertices so that *gradient* aligns with E_1, matrix-free.
+def align_basis(gradient: np.ndarray) -> np.ndarray:
+    """First row of the Householder reflection mapping *gradient* to basis e1: ``+||g||·e₁``, matrix-free.
 
-    Uses a Householder reflection Q = I - 2 v v^T / (v^T v) with
-    v = g_hat - e_1, giving Q @ g_hat = +e_1.  The full matrix is never
-    formed; vertices are rotated via the rank-1 update and Q's first row
-    is returned as a vector for downstream rf1 computation.
-
-    Parameters
-    ----------
-    cell : HalfspaceIntersection
-        Polytope whose vertices are stored in ``cell.intersections``.
-    gradient : ndarray, shape (n,) or (n, 1)
-        Non-zero gradient of the Lyapunov function in this cell.
-
-    Returns
-    -------
-    q1 : ndarray, shape (n,)
-        First row of Q.  ``q1 @ f`` gives the rotated first component of f.
-    rotated_vertices : ndarray, shape (num_intersections, n)
-        ``cell.intersections`` after applying Q.
+    Algorithm 5.1.1 from Golub & Van Loan, *Matrix Computations* 4th ed,
+    adapted for a single reflection (no ``v(1)=1`` normalization or packed storage).
     """
     g = np.asarray(gradient, dtype=float).flatten()
     n = g.shape[0]
-    g_hat = g / np.linalg.norm(g)
+    mu = np.linalg.norm(g)  # textbook: mu = ||x||
+    if mu < EPS:
+        raise ValueError("Gradient is zero; cannot align basis.")
 
-    e1 = np.zeros(n)
-    e1[0] = 1.0
+    e_1 = np.zeros(n)
+    e_1[0] = 1.0
 
-    v = g_hat - e1
+    sigma = np.dot(g[1:], g[1:])  # textbook: sigma = x(2:m)^T x(2:m)
+
+    # Householder vector v: only v[0] differs from g, v[1:] = g[1:]
+    v = g.copy()
+    if sigma < EPS:
+        if g[0] >= 0:
+            return e_1.copy()  # already along +e_1, Q = I
+        else:
+            v[0] = g[0] - mu  # along -e_1, no cancellation
+    elif g[0] <= 0:
+        v[0] = g[0] - mu  # no cancellation: both terms same sign
+    else:
+        v[0] = -sigma / (g[0] + mu)  # avoids cancellation when g[0] > 0
+
+    # beta = 2/(v^T v); textbook folds this into a normalized v(1)=1 form we don't need
     vtv = np.dot(v, v)
+    beta = 2.0 / vtv
 
-    # Pull it here to avoid more lookups
-    vertices = cell.intersections
+    # Only the first row of Q = I - beta*v*v^T is needed downstream
+    q1 = e_1 - (beta * v[0]) * v
 
-    if vtv < 1e-14:
-        # gradient already aligned with e_1
-        return e1.copy(), vertices.copy()
-
-    # Matrix-free rotation: Q @ x = x - 2 v (v^T x) / (v^T v)
-    # For rows of `vertices` (shape m x n): proj has shape (m,)
-    proj = (vertices @ v) / vtv
-    rotated_vertices = vertices - 2.0 * np.outer(proj, v)
-
-    # First row of Q: e_1 - 2 v[0] v / (v^T v)
-    q1 = e1 - 2.0 * v[0] * v / vtv
-
-    return q1, rotated_vertices
+    return q1
 
 
 def contains_point(cell: HalfspaceIntersection, point: np.ndarray) -> bool:

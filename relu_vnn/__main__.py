@@ -118,6 +118,7 @@ def _unpack_verify(
 
     origin_cexs: list[tuple] = []
     spatial_cexs: list[tuple] = []
+    n_filtered = 0
 
     # Origin — always kept, never distance-filtered
     arr = results["origin"]
@@ -134,6 +135,13 @@ def _unpack_verify(
                 dist_sq = sum(v**2 for v in pt[:-1])
                 if dist_sq >= epsilon**2:
                     spatial_cexs.append(pt)
+                else:
+                    n_filtered += 1
+
+    if n_filtered > 0:
+        print(
+            f"  (filtered {n_filtered} counterexamples within epsilon={epsilon:.0e} of origin)"
+        )
 
     cells = cast(list[HalfspaceIntersection], results.get("cells", []))
     cell_coords = [cell.intersections.tolist() for cell in cells]
@@ -296,7 +304,7 @@ def main():
     parser.add_argument(
         "--epsilon",
         type=float,
-        default=1e-8,
+        default=1e-4,
         help="Skip spatial counterexamples within this distance of origin",
     )
     parser.add_argument(
