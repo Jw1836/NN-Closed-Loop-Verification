@@ -195,69 +195,28 @@ class LyapunovProblem:
             # --- shgo for cells where vertices are all negative ---
             # Halfspace constraints: each row of cell.halfspaces is [A_i | b_i]
             # with A_i @ x + b_i <= 0.  scipy convention: g(x) >= 0.
-            A_hs = c.halfspaces[:, :-1]
-            b_hs = c.halfspaces[:, -1]
-            constraints = [
-                {"type": "ineq", "fun": lambda x, i=i: -(A_hs[i] @ x + b_hs[i])}
-                for i in range(len(A_hs))
-            ]
+            A_hs = np.asarray(c.halfspaces[:, :-1], dtype=np.float64)
+            b_hs = np.asarray(c.halfspaces[:, -1], dtype=np.float64)
+
+            # SLSQP constraints: -A_hs @ x - b_hs >= 0 (vectorized)
+            constraints = {
+                "type": "ineq",
+                "fun": lambda x: -A_hs @ x - b_hs,
+                "jac": lambda _x: -A_hs,
+            }
 
             q1_tensor = torch.tensor(q1, dtype=torch.float32)
 
-            def _neg_v_i_1_scalar(x_t: torch.Tensor) -> torch.Tensor:
-                """-(f(x) @ q1) as a scalar tensor, for reuse by val/grad/hess."""
-                return -(self.dynamics(x_t.unsqueeze(0)).squeeze(0) @ q1_tensor)
-
             def v_i_1(x_np: np.ndarray) -> tuple[float, np.ndarray]:
-                """Negated v_i_1 with gradient via autograd. Returns (value, grad)."""
+                """Negated v_i_1 with gradient via autograd.
+                Returns (value, grad), as expected by shgo with jac=True.
+                """
                 x_t = torch.tensor(
                     np.atleast_1d(x_np), dtype=torch.float32
                 ).requires_grad_(True)
-                val = _neg_v_i_1_scalar(x_t)
+                val = -(self.dynamics(x_t.unsqueeze(0)).squeeze(0) @ q1_tensor)
                 val.backward()
-                return val.detach().item(), x_t.grad.numpy()  # type: ignore[union-attr]
-
-            def v_i_1_hess(x_np: np.ndarray) -> np.ndarray:
-                """Full Hessian H(x) via row-wise autograd. Returns (n, n) array."""
-                x_t = torch.tensor(
-                    np.atleast_1d(x_np), dtype=torch.float32
-                ).requires_grad_(True)
-                val = _neg_v_i_1_scalar(x_t)
-                (grad,) = torch.autograd.grad(val, x_t, create_graph=True)
-                n = x_t.shape[0]
-                rows = [
-                    torch.autograd.grad(grad[i], x_t, retain_graph=i < n - 1)[0]
-                    for i in range(n)
-                ]
-                return np.stack([r.detach().numpy() for r in rows], axis=0)
-
-            _last_printed_iter = [-1]
-
-            def callback_wrapper(xk, state):
-                # trust-constr: state.fun = -(q1·f(x)), so -state.fun is V_dot.
-                # Print every 10 iterations to avoid flooding output on large cells.
-                if state.nit % 10 != 0:
-                    return
-                _last_printed_iter[0] = state.nit
-                v_dot = -float(state.fun)
-                elapsed = time.perf_counter() - t0
-                x_str = np.array2string(xk, precision=3, suppress_small=True)
-                print(
-                    f"  [{cell_idx + 1}/{n_cells}] iter {state.nit:3d}"
-                    f"  x={x_str}  v_dot={v_dot:.4g}  ({elapsed:.3f}s)"
-                )
-                if callback is not None:
-                    callback(
-                        cell_idx,
-                        n_cells,
-                        {
-                            "bounds": bounds,
-                            "grad_norm": grad_norm,
-                            "outcome": "shgo_iter",
-                            "v_dot_max": v_dot,
-                            "elapsed": elapsed,
-                        },
-                    )
+                return val.detach().item(), np.asarray(x_t.grad, dtype=np.float64)  # type: ignore[union-attr]
 
             # shgo minimizes v_i_1; f_min=0 stops early on finding a violation.
             with warnings.catch_warnings():
@@ -271,10 +230,8 @@ class LyapunovProblem:
                     sampling_method="simplicial",
                     options={"f_min": 0.0, "minimize_every_iter": True, "maxiter": 20},
                     minimizer_kwargs={
-                        "method": "trust-constr",
+                        "method": "SLSQP",
                         "jac": True,
-                        "hess": v_i_1_hess,
-                        "callback": callback_wrapper,
                     },
                 )
             if not result.success:
