@@ -1,10 +1,11 @@
-"""Basic smoke tests for enumerate_cells_bfs."""
+"""Tests for enumerate_cells_bfs: correctness of ReLU hyperplane cell enumeration."""
 
 import numpy as np
 import pytest
 from scipy.spatial import ConvexHull, HalfspaceIntersection
 
 from relu_vnn.hyperplane import (
+    EPS,
     build_bbox_halfspaces,
     build_cell_halfspaces,
     enumerate_cells_bfs,
@@ -131,3 +132,261 @@ def test_3d_point_in_cell(cells_3d):
         if np.all(hs[:, :3] @ test_point + hs[:, -1] <= 1e-10):
             found += 1
     assert found == 1
+
+
+# ---------------------------------------------------------------------------
+# Helper: n-dimensional test infrastructure
+# ---------------------------------------------------------------------------
+
+
+def _make_region(dim: int) -> np.ndarray:
+    """Return [-1, 1]^dim region."""
+    return np.tile([-1.0, 1.0], (dim, 1))
+
+
+def _bbox_volume(region: np.ndarray) -> float:
+    return float(np.prod(region[:, 1] - region[:, 0]))
+
+
+def _cell_volumes(cells: list) -> list[float]:
+    return [ConvexHull(c.intersections).volume for c in cells]
+
+
+def _count_containing_cells(cells: list, point: np.ndarray) -> int:
+    """Count how many cells contain a point (with EPS tolerance)."""
+    count = 0
+    for c in cells:
+        hs = c.halfspaces
+        if np.all(hs[:, :-1] @ point + hs[:, -1] <= EPS):
+            count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
+# A. Diagonal hyperplane (non-axis-aligned)
+# ---------------------------------------------------------------------------
+
+
+class TestDiagonalHyperplane:
+    """Single neuron w = [1,...,1], b = 0 cuts the cube along the diagonal."""
+
+    @pytest.fixture(params=[2, 3, 5])
+    def setup(self, request):
+        dim = request.param
+        W = np.ones((dim, 1))
+        B = np.array([0.0])
+        region = _make_region(dim)
+        bbox_hs = build_bbox_halfspaces(region)
+        cells = enumerate_cells_bfs(W, B, bbox_hs, region)
+        return dim, region, cells
+
+    def test_two_cells(self, setup):
+        _, _, cells = setup
+        assert len(cells) == 2
+
+    def test_tiles_domain(self, setup):
+        _, region, cells = setup
+        total = sum(_cell_volumes(cells))
+        assert total == pytest.approx(_bbox_volume(region), abs=1e-6)
+
+    def test_cells_have_enough_vertices(self, setup):
+        dim, _, cells = setup
+        for c in cells:
+            hull = ConvexHull(c.intersections)
+            assert len(hull.vertices) >= dim + 1
+
+
+# ---------------------------------------------------------------------------
+# B. Shifted hyperplane (non-zero bias, unequal volumes)
+# ---------------------------------------------------------------------------
+
+
+class TestShiftedHyperplane:
+    """Single neuron along x1, shifted to x1 = 0.5."""
+
+    @pytest.fixture(params=[2, 3, 5])
+    def setup(self, request):
+        dim = request.param
+        W = np.zeros((dim, 1))
+        W[0, 0] = 1.0
+        B = np.array([-0.5])  # hyperplane at x1 = 0.5
+        region = _make_region(dim)
+        bbox_hs = build_bbox_halfspaces(region)
+        cells = enumerate_cells_bfs(W, B, bbox_hs, region)
+        return dim, region, cells
+
+    def test_two_cells(self, setup):
+        _, _, cells = setup
+        assert len(cells) == 2
+
+    def test_tiles_domain(self, setup):
+        _, region, cells = setup
+        total = sum(_cell_volumes(cells))
+        assert total == pytest.approx(_bbox_volume(region), abs=1e-6)
+
+    def test_unequal_volumes(self, setup):
+        dim, _, cells = setup
+        vols = sorted(_cell_volumes(cells))
+        # x1 in [-1, 0.5] has width 1.5, x1 in [0.5, 1] has width 0.5
+        # other dims have width 2 each → ratio is 3:1
+        cross_section = 2.0 ** (dim - 1)
+        assert vols[0] == pytest.approx(0.5 * cross_section, abs=1e-6)
+        assert vols[1] == pytest.approx(1.5 * cross_section, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# C. Hyperplane outside domain
+# ---------------------------------------------------------------------------
+
+
+class TestOutsideDomain:
+    """Single neuron whose hyperplane x1 = 5 lies entirely outside [-1,1]^n."""
+
+    @pytest.fixture(params=[2, 3, 5])
+    def setup(self, request):
+        dim = request.param
+        W = np.zeros((dim, 1))
+        W[0, 0] = 1.0
+        B = np.array([-5.0])
+        region = _make_region(dim)
+        bbox_hs = build_bbox_halfspaces(region)
+        cells = enumerate_cells_bfs(W, B, bbox_hs, region)
+        return dim, region, cells
+
+    def test_one_cell(self, setup):
+        _, _, cells = setup
+        assert len(cells) == 1
+
+    def test_full_volume(self, setup):
+        _, region, cells = setup
+        total = sum(_cell_volumes(cells))
+        assert total == pytest.approx(_bbox_volume(region), abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# D. Hyperplane on domain boundary
+# ---------------------------------------------------------------------------
+
+
+class TestBoundaryHyperplane:
+    """Hyperplane x1 = 1.0, exactly on the edge of [-1,1]^n."""
+
+    @pytest.fixture(params=[2, 3, 5])
+    def setup(self, request):
+        dim = request.param
+        W = np.zeros((dim, 1))
+        W[0, 0] = 1.0
+        B = np.array([-1.0])
+        region = _make_region(dim)
+        bbox_hs = build_bbox_halfspaces(region)
+        cells = enumerate_cells_bfs(W, B, bbox_hs, region)
+        return dim, region, cells
+
+    def test_tiles_domain(self, setup):
+        _, region, cells = setup
+        total = sum(_cell_volumes(cells))
+        assert total == pytest.approx(_bbox_volume(region), abs=1e-6)
+
+    def test_at_most_two_cells(self, setup):
+        _, _, cells = setup
+        assert 1 <= len(cells) <= 2
+
+
+# ---------------------------------------------------------------------------
+# E. Mixed inside/outside neurons
+# ---------------------------------------------------------------------------
+
+
+class TestMixedNeurons:
+    """n neurons at origin + n neurons at x=5 (outside domain)."""
+
+    @pytest.fixture(params=[2, 3, 5])
+    def setup(self, request):
+        dim = request.param
+        # n "inside" neurons (coordinate hyperplanes) + n "outside" neurons
+        n_inside = dim
+        n_outside = dim
+        W = np.zeros((dim, n_inside + n_outside))
+        W[:, :n_inside] = np.eye(dim)  # coordinate hyperplanes at origin
+        W[:, n_inside:] = np.eye(dim)  # same directions ...
+        B = np.zeros(n_inside + n_outside)
+        B[n_inside:] = -5.0  # ... but shifted to x_i = 5
+        region = _make_region(dim)
+        bbox_hs = build_bbox_halfspaces(region)
+        cells = enumerate_cells_bfs(W, B, bbox_hs, region)
+        return dim, region, cells
+
+    def test_cell_count(self, setup):
+        dim, _, cells = setup
+        # Only the n inside hyperplanes create cells: 2^n cells
+        assert len(cells) == 2**dim
+
+    def test_tiles_domain(self, setup):
+        _, region, cells = setup
+        total = sum(_cell_volumes(cells))
+        assert total == pytest.approx(_bbox_volume(region), abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# F. Single neuron (simplest nontrivial case)
+# ---------------------------------------------------------------------------
+
+
+class TestSingleNeuron:
+    """One neuron with x1 = 0 → exactly 2 cells."""
+
+    @pytest.fixture(params=[2, 3, 5])
+    def setup(self, request):
+        dim = request.param
+        W = np.zeros((dim, 1))
+        W[0, 0] = 1.0
+        B = np.array([0.0])
+        region = _make_region(dim)
+        bbox_hs = build_bbox_halfspaces(region)
+        cells = enumerate_cells_bfs(W, B, bbox_hs, region)
+        return dim, region, cells
+
+    def test_two_cells(self, setup):
+        _, _, cells = setup
+        assert len(cells) == 2
+
+    def test_tiles_domain(self, setup):
+        _, region, cells = setup
+        total = sum(_cell_volumes(cells))
+        assert total == pytest.approx(_bbox_volume(region), abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# G. Non-overlapping: random points each in exactly one cell
+# ---------------------------------------------------------------------------
+
+
+class TestNonOverlapping:
+    """Random interior points must belong to exactly one cell."""
+
+    @pytest.fixture(
+        params=[
+            (W_MATRIX, B_VECTOR, REGION),
+            (W_3D, B_3D, REGION_3D),
+            (np.eye(5), np.zeros(5), _make_region(5)),
+        ],
+        ids=["2d-quadrants", "3d-octants", "5d-orthants"],
+    )
+    def setup(self, request):
+        W, B, region = request.param
+        bbox_hs = build_bbox_halfspaces(region)
+        cells = enumerate_cells_bfs(W, B, bbox_hs, region)
+        return region, cells
+
+    def test_each_point_in_exactly_one_cell(self, setup):
+        region, cells = setup
+        dim = region.shape[0]
+        n_points = 200 if dim >= 5 else 100
+        rng = np.random.default_rng(42)
+        # Sample interior points (shrink by 1% to avoid exact boundaries)
+        lo = region[:, 0] * 0.99
+        hi = region[:, 1] * 0.99
+        for _ in range(n_points):
+            pt = rng.uniform(lo, hi)
+            count = _count_containing_cells(cells, pt)
+            assert count == 1, f"Point {pt} in {count} cells (expected 1)"

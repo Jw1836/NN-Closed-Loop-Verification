@@ -66,6 +66,24 @@ def _check_cell_lie(args):
 
     # Fast and easy pre-check just at vertices and interior point before solver
     check_pts = np.vstack([verts, cell.interior_point[np.newaxis]])
+    # Remove points near origin (norm < EPS)
+    norms = np.linalg.norm(check_pts, axis=1)
+    check_pts = check_pts[norms >= EPS]
+    if len(check_pts) == 0:
+        # Cell is essentially at the origin; decrease condition is only required
+        # away from the origin (origin itself is handled by check_origin).
+        elapsed = time.perf_counter() - t0
+        return {
+            "cell_idx": cell_idx,
+            "outcome": "zero_norm",
+            "violations": [],
+            "bounds": bounds,
+            "grad_norm": grad_norm,
+            "v_dot_max": 0.0,
+            "elapsed": elapsed,
+            "bounds_str": bounds_str,
+            "n_pts": 0,
+        }
     x_t = torch.tensor(check_pts, dtype=torch.float32)
     with torch.no_grad():
         f_check = dynamics(x_t).numpy()
@@ -160,7 +178,7 @@ def _check_cell_lie(args):
             "violations": [],
             "bounds": bounds,
             "grad_norm": grad_norm,
-            "v_dot_max": float(-result.fun),
+            "v_dot_max": float(-result.fun) if result.fun is not None else 0.0,
             "elapsed": elapsed,
             "bounds_str": bounds_str,
             "n_pts": 0,
@@ -177,14 +195,14 @@ class LyapunovProblem:
         nn_lyapunov: nn.Module,
         dynamics: nn.Module,
         region: Tensor,
-        n_workers: int = 1,
+        max_workers: int = 1,
     ) -> None:
         self.nn_lyapunov = nn_lyapunov
         self.dynamics = dynamics
         self.region = region
         self.hole: float = EPS  # Hole around origin for numerical stability
         self.early_exit: bool = False
-        self.n_workers: int = n_workers
+        self.max_workers: int = max_workers
 
     @property
     def state_dim(self) -> int:
@@ -292,9 +310,14 @@ class LyapunovProblem:
             for i, c in enumerate(cells)
         ]
 
-        if self.n_workers > 1:
+        # Each worker needs at least 4 cells to be worth the overhead
+        n_workers = min(n_cells // 4, self.max_workers)
+        print(
+            f"Checking decrease condition on {n_cells} cells with {n_workers} workers..."
+        )
+        if n_workers > 1:
             ctx = mp.get_context("forkserver")
-            with ctx.Pool(self.n_workers) as pool:
+            with ctx.Pool(n_workers) as pool:
                 results = pool.map(_check_cell_lie, args_list)
         else:
             results = [_check_cell_lie(a) for a in args_list]
@@ -313,7 +336,7 @@ class LyapunovProblem:
             bounds_str = r["bounds_str"]
             elapsed = r["elapsed"]
 
-            if outcome == "shgo_certified":
+            if outcome in ("shgo_certified", "zero_norm"):
                 n_certified += 1
                 print(
                     f"[{cell_idx + 1}/{n_cells}] certified  {bounds_str}"

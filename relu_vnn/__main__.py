@@ -24,6 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch import nn
 from typing import cast
 
 from .lyapunov import LyapunovProblem, lyapunov_loss_function, train_lyapunov_2d
@@ -215,6 +216,15 @@ def _retrain(
         loss.backward()
         optimizer.step()
         scheduler.step()
+        # Project output bias so V(0) = 0 exactly after every step.
+        # V(0)^2 has near-zero gradient when V(0) is already small, so gradient
+        # descent alone stalls. Subtracting V(0) from the output bias is exact.
+        with torch.no_grad():
+            origin_dev = torch.zeros(1, problem.state_dim, device=device)
+            v0 = problem.nn_lyapunov(origin_dev).squeeze()
+            net_seq = cast(nn.Sequential, problem.nn_lyapunov.network)
+            out_layer = cast(nn.Linear, net_seq[2])
+            out_layer.bias -= v0
         if (epoch + 1) % 100 == 0:
             print(
                 f"  retrain epoch [{epoch + 1}/{epochs}]  "
@@ -400,10 +410,10 @@ def main():
         help="Stop verification after the first failing condition",
     )
     parser.add_argument(
-        "--num-workers",
+        "--max-workers",
         type=int,
         default=1,
-        help="Worker processes for per-cell Lie derivative checks",
+        help="Max worker processes for per-cell Lie derivative checks (actual count = min(cells//4, max))",
     )
     parser.add_argument(
         "--hole",
@@ -421,7 +431,7 @@ def main():
     problem = mod.make_problem(**kwargs)
 
     problem.early_exit = args.early_exit
-    problem.n_workers = args.num_workers
+    problem.max_workers = args.max_workers
     if args.hole is not None:
         problem.hole = args.hole
 
@@ -449,7 +459,7 @@ def main():
         f"  retrain_lr={args.retrain_lr}  cex_weight={args.cex_weight}"
         f"  epsilon={args.epsilon}  cex_window={args.cex_window}"
         f"  max_iter={args.max_iterations}"
-        f"  early_exit={args.early_exit}  num_workers={args.num_workers}  hole={problem.hole}"
+        f"  early_exit={args.early_exit}  max_workers={args.max_workers}  hole={problem.hole}"
     )
     print()
 

@@ -1,7 +1,6 @@
 """Tests for align_basis: Householder rotation aligning gradient with e_1."""
 
 import numpy as np
-import pytest
 
 from relu_vnn.hyperplane import align_basis
 
