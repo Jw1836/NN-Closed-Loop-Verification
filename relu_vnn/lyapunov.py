@@ -66,9 +66,9 @@ def _check_cell_lie(args) -> dict[str, object]:
 
     # Fast and easy pre-check just at vertices and interior point before solver
     check_pts = np.vstack([verts, cell.interior_point[np.newaxis]])
-    # Remove points near origin (norm < EPS)
+    # Remove points near origin (norm < hole)
     norms = np.linalg.norm(check_pts, axis=1)
-    check_pts = check_pts[norms >= EPS]
+    check_pts = check_pts[norms >= hole]
     if len(check_pts) == 0:
         # Cell is essentially at the origin; decrease condition is only required
         # away from the origin (origin itself is handled by check_origin).
@@ -114,11 +114,20 @@ def _check_cell_lie(args) -> dict[str, object]:
     # Pass convex polytope constraints to minimizer
     A_hs = np.asarray(cell.halfspaces[:, :-1], dtype=np.float64)
     b_hs = np.asarray(cell.halfspaces[:, -1], dtype=np.float64)
-    constraints = {
-        "type": "ineq",
-        "fun": lambda x: -A_hs @ x - b_hs,
-        "jac": lambda _x: -A_hs,
-    }
+    hole_sq = float(hole) ** 2
+    constraints = [
+        {
+            "type": "ineq",
+            "fun": lambda x: -A_hs @ x - b_hs,
+            "jac": lambda _x: -A_hs,
+        },
+        {
+            # Exclude the ball of radius hole: ||x||^2 - hole^2 >= 0
+            "type": "ineq",
+            "fun": lambda x: float(np.dot(x, x)) - hole_sq,
+            "jac": lambda x: 2.0 * np.asarray(x, dtype=np.float64),
+        },
+    ]
 
     q1_tensor = torch.tensor(q1, dtype=torch.float32)
 
