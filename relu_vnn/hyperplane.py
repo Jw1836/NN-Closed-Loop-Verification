@@ -8,14 +8,16 @@ Pipeline:
   2. align_basis / check_decrease  - rotate cell, verify Lie derivative per cell
 """
 
+import logging
 from collections import deque
-
 import numpy as np
 import torch
 from scipy.optimize import linprog
 from scipy.spatial import HalfspaceIntersection
 from typing import Sequence, cast
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 # float32 numerical tolerance (~10× machine epsilon)
 EPS: float = 1e-6
@@ -202,8 +204,8 @@ def enumerate_cells_bfs(
                 # empty).  A zero-volume cell has no interior and therefore no
                 # tight hyperplanes that could lead to undiscovered neighbors.
                 if is_seed:
-                    print(
-                        "  [BFS seed] Chebyshev center LP infeasible — seed cell skipped"
+                    logger.warning(
+                        "[BFS seed] Chebyshev center LP infeasible — seed cell skipped"
                     )
                 is_seed = False
                 continue
@@ -217,7 +219,7 @@ def enumerate_cells_bfs(
             )
         except QhullError as e:
             if is_seed:
-                print(f"  [BFS seed] QhullError in HalfspaceIntersection: {e}")
+                logger.warning("[BFS seed] QhullError in HalfspaceIntersection: %s", e)
             is_seed = False
             continue  # degenerate (e.g. numerically flat cell)
 
@@ -227,8 +229,10 @@ def enumerate_cells_bfs(
         # ConvexHull filters these and gives vertices in CCW order.
         if len(raw_verts) < state_dim + 1:
             if is_seed:
-                print(
-                    f"  [BFS seed] too few raw vertices: {len(raw_verts)} < {state_dim + 1}"
+                logger.warning(
+                    "[BFS seed] too few raw vertices: %d < %d",
+                    len(raw_verts),
+                    state_dim + 1,
                 )
             is_seed = False
             continue
@@ -236,13 +240,15 @@ def enumerate_cells_bfs(
             hull = ConvexHull(raw_verts, incremental=False)
         except QhullError as e:
             if is_seed:
-                print(f"  [BFS seed] QhullError in ConvexHull: {e}")
+                logger.warning("[BFS seed] QhullError in ConvexHull: %s", e)
             is_seed = False
             continue  # degenerate (collinear points, etc.)
         if len(hull.vertices) < state_dim + 1:
             if is_seed:
-                print(
-                    f"  [BFS seed] too few hull vertices: {len(hull.vertices)} < {state_dim + 1}"
+                logger.warning(
+                    "[BFS seed] too few hull vertices: %d < %d",
+                    len(hull.vertices),
+                    state_dim + 1,
                 )
             is_seed = False
             continue

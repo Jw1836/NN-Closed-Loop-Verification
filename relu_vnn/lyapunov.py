@@ -1,6 +1,7 @@
 """Defines the LyapunovProblem dataclass — the common interface
 that verifiers and the Lyapunov network are handed."""
 
+import logging
 import multiprocessing as mp
 import time
 import warnings
@@ -11,6 +12,8 @@ from torch import nn, Tensor
 from scipy.spatial import HalfspaceIntersection
 
 from relu_vnn.hyperplane import EPS
+
+logger = logging.getLogger(__name__)
 
 
 def _check_cell_lie(args) -> dict[str, object]:
@@ -267,7 +270,7 @@ class LyapunovProblem:
         all_verts = all_verts[norms >= self.hole]
 
         if len(all_verts) == 0:
-            print("Warning: all vertices at origin. Skipping.")
+            logger.warning("All vertices at origin — skipping positivity check.")
             return {"passed": True, "n_violations": 0, "counterexamples": None}
 
         x = torch.tensor(all_verts, dtype=torch.float32, device=self.device)
@@ -336,8 +339,10 @@ class LyapunovProblem:
 
         # Each worker needs at least 4 cells to be worth the overhead
         n_workers = min(n_cells // 4, self.max_workers)
-        print(
-            f"Checking decrease condition on {n_cells} cells with {n_workers} workers..."
+        logger.info(
+            "Checking decrease condition on %d cells with %d workers...",
+            n_cells,
+            n_workers,
         )
         if n_workers > 1:
             ctx = mp.get_context("forkserver")
@@ -355,33 +360,49 @@ class LyapunovProblem:
         n_violated = 0
 
         for r in results:
-            cell_idx = r["cell_idx"]
-            outcome = r["outcome"]
-            bounds_str = r["bounds_str"]
-            elapsed = r["elapsed"]
+            cell_idx = int(r["cell_idx"])  # type: ignore[arg-type]
+            outcome = str(r["outcome"])
+            bounds_str = str(r["bounds_str"])
+            elapsed = float(r["elapsed"])  # type: ignore[arg-type]
 
             if outcome in ("shgo_certified", "zero_norm"):
                 n_certified += 1
-                print(
-                    f"[{cell_idx + 1}/{n_cells}] certified  {bounds_str}"
-                    f"  ({elapsed:.3f}s)"
+                logger.debug(
+                    "[%d/%d] certified  %s  (%.3fs)",
+                    cell_idx + 1,
+                    n_cells,
+                    bounds_str,
+                    elapsed,
                 )
             else:
                 n_violated += 1
                 if outcome == "zero_grad":
-                    print(
-                        f"[{cell_idx + 1}/{n_cells}] zero-grad violation  {bounds_str}"
-                        f"  ({elapsed:.3f}s)"
+                    logger.info(
+                        "[%d/%d] zero-grad violation  %s  (%.3fs)",
+                        cell_idx + 1,
+                        n_cells,
+                        bounds_str,
+                        elapsed,
                     )
                 elif outcome == "pre-check_violation":
-                    print(
-                        f"[{cell_idx + 1}/{n_cells}] pre-check violation  {bounds_str}"
-                        f"  v_dot_max={r['v_dot_max']:.4g}  ({r['n_pts']} pts)  ({elapsed:.3f}s)"
+                    logger.info(
+                        "[%d/%d] pre-check violation  %s  v_dot_max=%.4g  (%d pts)  (%.3fs)",
+                        cell_idx + 1,
+                        n_cells,
+                        bounds_str,
+                        r["v_dot_max"],
+                        r["n_pts"],
+                        elapsed,
                     )
                 elif outcome == "shgo_violation":
-                    print(
-                        f"[{cell_idx + 1}/{n_cells}] shgo violation  {bounds_str}"
-                        f"  v_dot_max={r['v_dot_max']:.4g}  ({r['n_pts']} pts)  ({elapsed:.3f}s)"
+                    logger.info(
+                        "[%d/%d] shgo violation  %s  v_dot_max=%.4g  (%d pts)  (%.3fs)",
+                        cell_idx + 1,
+                        n_cells,
+                        bounds_str,
+                        r["v_dot_max"],
+                        r["n_pts"],
+                        elapsed,
                     )
 
             violations.extend(r["violations"])
@@ -399,9 +420,12 @@ class LyapunovProblem:
                     },
                 )
 
-        print(
-            f"check_decrease done: {n_certified}/{n_cells} certified, "
-            f"{n_violated}/{n_cells} violated"
+        logger.info(
+            "check_decrease done: %d/%d certified, %d/%d violated",
+            n_certified,
+            n_cells,
+            n_violated,
+            n_cells,
         )
         cex_array = np.vstack(violations) if violations else None
         return {
@@ -421,16 +445,16 @@ class LyapunovProblem:
         )
 
         region_np = self.region.numpy()
-        print("Extracting weights and building bounding-box halfspaces...")
+        logger.info("Extracting weights and building bounding-box halfspaces...")
         t0 = time.perf_counter()
         W_matrix, B_vector, _ = extract_weights(self.nn_lyapunov)
         bbox_hs = build_bbox_halfspaces(region_np)
-        print(f"  done ({time.perf_counter() - t0:.3f}s)")
+        logger.info("  done (%.3fs)", time.perf_counter() - t0)
 
-        print("Enumerating cells via BFS...")
+        logger.info("Enumerating cells via BFS...")
         t0 = time.perf_counter()
         cells = enumerate_cells_bfs(W_matrix, B_vector, bbox_hs, region_np)
-        print(f"  done ({time.perf_counter() - t0:.3f}s)  — {len(cells)} cells")
+        logger.info("  done (%.3fs)  — %d cells", time.perf_counter() - t0, len(cells))
         return cells
 
     def verify(self) -> dict:
@@ -453,17 +477,17 @@ class LyapunovProblem:
         }
 
         # Criteria 1: V(0) = 0
-        print("Checking origin condition...")
+        logger.info("Checking origin condition...")
         t0 = time.perf_counter()
         results["origin"] = self.check_origin()
-        print(f"  done ({time.perf_counter() - t0:.3f}s)")
+        logger.info("  done (%.3fs)", time.perf_counter() - t0)
         if not results["origin"]["passed"]:
-            print(f"Origin violation: V(0) = {results['origin']['v0']:.6g}")
+            logger.info("Origin violation: V(0) = %.6g", results["origin"]["v0"])
             if self.early_exit:
-                print("Violation found! Exiting early.")
+                logger.info("Violation found! Exiting early.")
                 return results
         else:
-            print("Check passed!")
+            logger.info("Check passed!")
 
         # Build the cell decomposition for the next two checks.
         cells = self.enumerate_cells()
@@ -471,41 +495,47 @@ class LyapunovProblem:
         results["cells"] = cells
 
         # Criteria 2: V(x) > 0
-        print("Checking positive condition...")
+        logger.info("Checking positive condition...")
         t0 = time.perf_counter()
         results["positive"] = self.check_positive(cells)
-        print(f"  done ({time.perf_counter() - t0:.3f}s)")
+        logger.info("  done (%.3fs)", time.perf_counter() - t0)
         if not results["positive"]["passed"]:
-            print(f"Found {results['positive']['n_violations']} counterexamples.")
+            logger.info(
+                "Found %d counterexamples.", results["positive"]["n_violations"]
+            )
             if self.early_exit:
-                print("Violation found! Exiting early.")
+                logger.info("Violation found! Exiting early.")
                 return results
         else:
-            print("Check passed!")
+            logger.info("Check passed!")
 
         # Criteria 3: V_dot < 0
-        print("Checking decrease condition...")
+        logger.info("Checking decrease condition...")
         t0 = time.perf_counter()
         results["decrease"] = self.check_decrease(cells)
-        print(f"  done ({time.perf_counter() - t0:.3f}s)")
+        logger.info("  done (%.3fs)", time.perf_counter() - t0)
         if not results["decrease"]["passed"]:
-            print(f"Found {results['decrease']['n_violations']} counterexamples.")
+            logger.info(
+                "Found %d counterexamples.", results["decrease"]["n_violations"]
+            )
         else:
-            print("Check passed!")
+            logger.info("Check passed!")
 
-        print("Verification complete.")
-        print("Summary of results:")
+        logger.info("Verification complete.")
+        logger.info("Summary of results:")
         for key in ["origin", "positive", "decrease"]:
             r = results[key]
             if r is None:
-                print(f"  {key}: skipped")
+                logger.info("  %s: skipped", key)
             elif r["passed"]:
-                print(f"  {key}: PASSED")
+                logger.info("  %s: PASSED", key)
             elif key == "origin":
-                print(f"  {key}: FAILED (V(0) = {r['v0']:.6g})")
+                logger.info("  %s: FAILED (V(0) = %.6g)", key, r["v0"])
             else:
-                print(f"  {key}: FAILED with {r['n_violations']} counterexamples")
-        print(f"  cells: {results['n_cells']} returned.")
+                logger.info(
+                    "  %s: FAILED with %d counterexamples", key, r["n_violations"]
+                )
+        logger.info("  cells: %d returned.", results["n_cells"])
         return results
 
     def __repr__(self) -> str:
@@ -585,7 +615,7 @@ def train_model_lyapunov_general(
         loss.backward()
         optimizer.step()
         if (epoch + 1) % 100 == 0:
-            print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}")
+            logger.info("Epoch [%d/%d], Loss: %.4f", epoch + 1, num_epochs, loss.item())
     return model
 
 
@@ -641,8 +671,11 @@ def fine_tune_on_counterexamples(
         optimizer.step()
 
         if (epoch + 1) % 50 == 0:
-            print(
-                f"  fine-tune epoch [{epoch + 1}/{num_epochs}], lie_penalty={lie_penalty.item():.4f}"
+            logger.info(
+                "  fine-tune epoch [%d/%d], lie_penalty=%.4f",
+                epoch + 1,
+                num_epochs,
+                lie_penalty.item(),
             )
 
 
@@ -673,4 +706,4 @@ def train_lyapunov_2d(
         loss.backward()
         optimizer.step()
         if (epoch + 1) % 100 == 0:
-            print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}")
+            logger.info("Epoch [%d/%d], Loss: %.4f", epoch + 1, num_epochs, loss.item())

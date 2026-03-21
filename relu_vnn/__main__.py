@@ -17,6 +17,7 @@ import argparse
 import csv
 import importlib.util
 import json
+import logging
 import os
 import re
 import sys
@@ -624,6 +625,12 @@ def _add_common_args(parser: argparse.ArgumentParser):
         help="Override hidden layer size in the Lyapunov net",
     )
     parser.add_argument("--grid-pts", type=int, default=300)
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show per-cell certified lines during verification",
+    )
 
 
 def main():
@@ -675,6 +682,10 @@ def main():
     )
 
     args = parser.parse_args()
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    logging.getLogger("relu_vnn").setLevel(
+        logging.DEBUG if args.verbose else logging.INFO
+    )
     if args.subcommand == "verify":
         cmd_verify(args)
     else:
