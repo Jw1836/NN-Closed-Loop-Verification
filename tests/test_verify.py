@@ -1,6 +1,5 @@
 """Tests for LyapunovProblem.verify() orchestrator."""
 
-import numpy as np
 import pytest
 from scipy.spatial import ConvexHull, HalfspaceIntersection
 
@@ -16,7 +15,13 @@ def problem():
 class TestVerify:
     def test_returns_expected_keys(self, problem):
         results = problem.verify()
-        assert set(results.keys()) >= {"origin", "positive", "decrease", "cells"}
+        assert set(results.keys()) >= {
+            "origin",
+            "positive",
+            "decrease",
+            "cells",
+            "n_cells",
+        }
 
     def test_cells_are_halfspace_intersections(self, problem):
         results = problem.verify()
@@ -24,6 +29,10 @@ class TestVerify:
         assert isinstance(cells, list)
         assert len(cells) > 0
         assert all(isinstance(c, HalfspaceIntersection) for c in cells)
+
+    def test_n_cells_matches_cells_list(self, problem):
+        results = problem.verify()
+        assert results["n_cells"] == len(results["cells"])
 
     def test_cells_tile_region(self, problem):
         """Cell areas should sum to the bounding-box area."""
@@ -35,11 +44,15 @@ class TestVerify:
         cell_area = sum(ConvexHull(c.intersections).volume for c in results["cells"])
         assert cell_area == pytest.approx(region_area, abs=1e-6)
 
-    def test_check_results_are_ndarray_or_none(self, problem):
+    def test_check_results_are_dicts_or_none(self, problem):
         results = problem.verify()
         for key in ("origin", "positive", "decrease"):
             val = results[key]
-            assert val is None or isinstance(val, np.ndarray)
+            assert val is None or isinstance(val, dict)
+        # All checks should have run (no early exit)
+        for key in ("origin", "positive", "decrease"):
+            assert results[key] is not None
+            assert "passed" in results[key]
 
     def test_early_exit_skips_later_checks(self):
         """With early_exit=True and a broken origin, positive/decrease stay None."""
@@ -52,6 +65,7 @@ class TestVerify:
         prob.early_exit = True
         results = prob.verify()
         assert results["origin"] is not None
+        assert not results["origin"]["passed"]
         # Later checks should not have run
         assert results["positive"] is None
         assert results["decrease"] is None

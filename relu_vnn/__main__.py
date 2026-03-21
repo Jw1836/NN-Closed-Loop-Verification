@@ -1,20 +1,25 @@
 """Verification loop for ReLU Lyapunov functions.
 
 Usage:
-    python -m relu_vnn <problem_file.py> [options]
+    python -m relu_vnn train <problem_file.py> [options]
+    python -m relu_vnn verify <problem_file.py> [options]
 
 The problem file must define a `make_problem()` function that returns a
 LyapunovProblem instance.
 
 Example:
-    python -m relu_vnn problems/pendulum.py --hidden-size 30
-    python -m relu_vnn problems/duffing_oscillator.py --epochs 800
+    python -m relu_vnn train problems/pendulum.py --hidden-size 30
+    python -m relu_vnn train problems/duffing_oscillator.py --epochs 800
+    python -m relu_vnn verify problems/bilinear_oscillator.py --checkpoint checkpoints_bilinear_oscillator/iter_3.pt
 """
 
 import argparse
 import csv
 import importlib.util
+import json
+import logging
 import os
+import re
 import sys
 import time
 
@@ -24,6 +29,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch import nn
 from typing import cast
 
 from .lyapunov import LyapunovProblem, lyapunov_loss_function, train_lyapunov_2d
@@ -56,16 +62,21 @@ def load_checkpoint(checkpoint_dir: str, tag: str):
     return None
 
 
-def append_cex_log(cex_log_path: str, iteration: int, cexs: list[tuple]):
-    write_header = not os.path.exists(cex_log_path)
-    with open(cex_log_path, "a", newline="") as f:
-        writer = csv.writer(f)
-        if write_header:
-            # state dims + value column (last element of each cex tuple)
-            state_cols = [f"x{i + 1}" for i in range(len(cexs[0]) - 1)]
-            writer.writerow(["iteration"] + state_cols + ["dVx"])
-        for p in cexs:
-            writer.writerow([iteration] + list(p))
+def append_verify_log(log_path: str, iteration: int, verify_results: dict):
+    """Append one JSONL entry per iteration to the verification log."""
+    entry: dict = {"iteration": iteration, "timestamp": time.time()}
+    for key in ("n_cells", "origin", "positive", "decrease"):
+        val = verify_results.get(key)
+        if isinstance(val, dict):
+            # Exclude large counterexample lists from the summary log
+            entry[key] = {k: v for k, v in val.items() if k != "counterexamples"}
+            entry[key]["n_counterexamples"] = (
+                len(val["counterexamples"]) if val["counterexamples"] is not None else 0
+            )
+        else:
+            entry[key] = val
+    with open(log_path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
 # ── Problem loader ────────────────────────────────────────────────────────────
@@ -85,9 +96,10 @@ def load_problem_module(problem_path: str):
         sys.path.insert(0, mod_dir)
     mod_name = os.path.splitext(os.path.basename(path))[0]
     spec = importlib.util.spec_from_file_location(mod_name, path)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = mod
-    spec.loader.exec_module(mod)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
 
     if not hasattr(mod, "make_problem"):
         print(
@@ -104,44 +116,28 @@ def load_problem_module(problem_path: str):
 
 
 def _unpack_verify(
-    results: dict, epsilon: float
+    results: dict,
 ) -> tuple[list[tuple], list[tuple], list[list]]:
     """Extract counterexamples from a verify() result dict.
 
-    Origin failures are never filtered (V(0)!=0 is a categorical failure).
-    Positivity/decrease counterexamples within *epsilon* of the origin are
-    filtered out (numerical noise near the equilibrium).
-
     Returns (origin_cexs, spatial_cexs, cell_coords).
+    The check_* methods in LyapunovProblem are responsible for any hole filtering.
     """
     from scipy.spatial import HalfspaceIntersection
 
     origin_cexs: list[tuple] = []
     spatial_cexs: list[tuple] = []
-    n_filtered = 0
 
-    # Origin — always kept, never distance-filtered
-    arr = results["origin"]
-    if arr is not None:
-        for row in np.atleast_2d(arr):
+    origin = results["origin"]
+    if origin is not None and not origin["passed"]:
+        for row in origin["counterexamples"] or []:
             origin_cexs.append(tuple(float(v) for v in row))
 
-    # Positivity + decrease — distance-filtered
     for key in ("positive", "decrease"):
-        arr = results[key]
-        if arr is not None:
-            for row in np.atleast_2d(arr):
-                pt = tuple(float(v) for v in row)
-                dist_sq = sum(v**2 for v in pt[:-1])
-                if dist_sq >= epsilon**2:
-                    spatial_cexs.append(pt)
-                else:
-                    n_filtered += 1
-
-    if n_filtered > 0:
-        print(
-            f"  (filtered {n_filtered} counterexamples within epsilon={epsilon:.0e} of origin)"
-        )
+        check = results[key]
+        if check is not None and not check["passed"]:
+            for row in check["counterexamples"] or []:
+                spatial_cexs.append(tuple(float(v) for v in row))
 
     cells = cast(list[HalfspaceIntersection], results.get("cells", []))
     cell_coords = [cell.intersections.tolist() for cell in cells]
@@ -151,7 +147,6 @@ def _unpack_verify(
 def _print_verify_summary(
     origin_cexs: list[tuple], spatial_cexs: list[tuple], label: str = "Result"
 ):
-    """Print a human-readable summary of verification results."""
     parts = []
     if origin_cexs:
         parts.append(f"origin: FAILED (V(0)={origin_cexs[0][-1]:.6f})")
@@ -161,6 +156,117 @@ def _print_verify_summary(
         print(f"\n{label}: PASSED — no counterexamples.")
     else:
         print(f"\n{label}: {', '.join(parts)}")
+
+
+def _run_verify(
+    problem: LyapunovProblem, label: str
+) -> tuple[list[tuple], list[tuple], list[list], dict]:
+    """Verify, print summary, and return (origin_cexs, spatial_cexs, cell_coords, raw_results)."""
+    raw = problem.verify()
+    origin_cexs, spatial_cexs, cell_coords = _unpack_verify(raw)
+    _print_verify_summary(origin_cexs, spatial_cexs, label=label)
+    return origin_cexs, spatial_cexs, cell_coords, raw
+
+
+def _write_cex_csv(output_path: str, raw_results: dict, state_dim: int):
+    """Write counterexamples from all checks to a CSV file."""
+    rows = []
+    for check_type in ("origin", "positive", "decrease"):
+        check = raw_results.get(check_type)
+        if check is not None and not check["passed"]:
+            for row in check["counterexamples"] or []:
+                rows.append((check_type, *[float(v) for v in row]))
+
+    if not rows:
+        return
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["check"] + [f"x{i + 1}" for i in range(state_dim)] + ["value"])
+        writer.writerows(rows)
+    print(f"Counterexamples saved: {output_path}")
+
+
+def _problem_slug(problem: LyapunovProblem) -> str:
+    """Convert the problem class name to snake_case for use in filenames."""
+    name = type(problem).__name__
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+# ── Training helpers ──────────────────────────────────────────────────────────
+
+
+def _build_base_grid(problem: LyapunovProblem, grid_pts: int) -> torch.Tensor:
+    region_np = problem.region.numpy()
+    linspaces = [
+        np.linspace(region_np[d, 0], region_np[d, 1], grid_pts)
+        for d in range(problem.state_dim)
+    ]
+    mesh = np.meshgrid(*linspaces, indexing="ij")
+    return torch.tensor(
+        np.stack([m.ravel() for m in mesh], axis=1), dtype=torch.float32
+    )
+
+
+def _retrain(
+    problem: LyapunovProblem,
+    base_grid: torch.Tensor,
+    cexs: list[tuple],
+    epochs: int,
+    lr: float,
+    cex_weight: float,
+    device: torch.device,
+):
+    cex_tensor = torch.tensor([p[:-1] for p in cexs], dtype=torch.float32)
+    problem.to(device)
+    grid_dev = base_grid.to(device)
+    cex_dev = cex_tensor.to(device)
+
+    optimizer = torch.optim.Adam(problem.nn_lyapunov.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-5
+    )
+    for epoch in range(epochs):
+        problem.nn_lyapunov.train()
+        optimizer.zero_grad()
+        loss_grid = lyapunov_loss_function(
+            grid_dev, problem.nn_lyapunov, problem.dynamics
+        )
+        loss_cex = lyapunov_loss_function(
+            cex_dev, problem.nn_lyapunov, problem.dynamics
+        )
+        loss = loss_grid + cex_weight * loss_cex
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        # Project output bias so V(0) = 0 exactly after every step.
+        # V(0)^2 has near-zero gradient when V(0) is already small, so gradient
+        # descent alone stalls. Subtracting V(0) from the output bias is exact.
+        with torch.no_grad():
+            origin_dev = torch.zeros(1, problem.state_dim, device=device)
+            v0 = problem.nn_lyapunov(origin_dev).squeeze()
+            net_seq = cast(nn.Sequential, problem.nn_lyapunov.network)
+            out_layer = cast(nn.Linear, net_seq[2])
+            out_layer.bias -= v0
+        if (epoch + 1) % 100 == 0:
+            print(
+                f"  retrain epoch [{epoch + 1}/{epochs}]  "
+                f"grid={loss_grid.item():.4f}  cex={loss_cex.item():.4f}"
+            )
+
+
+def _find_resume_point(
+    checkpoint_dir: str, max_iterations: int, problem: LyapunovProblem
+) -> tuple[int, list[list[tuple]]]:
+    """Scan checkpoints newest-first; return (start_iteration, cex_history)."""
+    for i in range(max_iterations - 1, -1, -1):
+        ckpt = load_checkpoint(checkpoint_dir, f"iter_{i}")
+        if ckpt is not None:
+            problem.nn_lyapunov.load_state_dict(ckpt["model_state"])
+            cex_history = ckpt.get("cex_history", [])
+            print(f"Resuming from iteration {i + 1}")
+            return i + 1, cex_history
+    return 0, []
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
@@ -216,9 +322,10 @@ def plot_verification(
     ax.set_xlabel("x1")
     ax.set_ylabel("x2")
     plt.tight_layout()
-    fig.savefig(os.path.join(checkpoint_dir, filename), dpi=150)
+    save_path = os.path.join(checkpoint_dir, filename)
+    fig.savefig(save_path, dpi=150)
     plt.close(fig)
-    print(f"Plot saved: {checkpoint_dir}/{filename}")
+    print(f"Plot saved: {save_path}")
 
 
 def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem):
@@ -279,60 +386,66 @@ def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem)
     print(f"Plot saved: {checkpoint_dir}/cex_history.png")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Subcommands ───────────────────────────────────────────────────────────────
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Verification loop for ReLU Lyapunov functions"
-    )
-    parser.add_argument(
-        "problem_file",
-        help="Path to a Python file defining make_problem() -> LyapunovProblem",
-    )
-    parser.add_argument(
-        "--checkpoint-dir",
-        default=None,
-        help="Directory for checkpoints (default: checkpoints_<problem_name>)",
-    )
-    parser.add_argument("--max-iterations", type=int, default=5)
-    parser.add_argument("--epochs", type=int, default=800)
-    parser.add_argument("--lr", type=float, default=1e-3, help="Initial training LR")
-    parser.add_argument("--grid-pts", type=int, default=300)
-    parser.add_argument("--retrain-lr", type=float, default=4e-4)
-    parser.add_argument("--cex-weight", type=float, default=10.0)
-    parser.add_argument(
-        "--epsilon",
-        type=float,
-        default=1e-4,
-        help="Skip spatial counterexamples within this distance of origin",
-    )
-    parser.add_argument(
-        "--cex-window",
-        type=int,
-        default=3,
-        help="Retrain on current + this many prior iterations",
-    )
-    parser.add_argument(
-        "--hidden-size",
-        type=int,
-        default=None,
-        help="Override hidden layer size in the Lyapunov net",
-    )
-    parser.add_argument("--device", default="cpu", help="torch device (cpu or cuda)")
-    parser.add_argument(
-        "--early-exit",
-        action="store_true",
-        help="Stop verification after the first failing condition",
-    )
-    parser.add_argument(
-        "--hole",
-        type=float,
-        default=None,
-        help="Hole radius around origin for positivity check (default: problem default)",
-    )
-    args = parser.parse_args()
+def cmd_verify(args):
+    mod = load_problem_module(args.problem_file)
+    kwargs = {}
+    if args.hidden_size is not None:
+        kwargs["hidden_size"] = args.hidden_size
+    problem = mod.make_problem(**kwargs)
 
+    problem.early_exit = args.early_exit
+    problem.max_workers = args.max_workers
+    if args.hole is not None:
+        problem.hole = args.hole
+
+    if args.checkpoint is not None:
+        path = args.checkpoint
+        if not os.path.isfile(path):
+            print(f"Error: checkpoint not found: {path}", file=sys.stderr)
+            sys.exit(1)
+        ckpt = torch.load(path, weights_only=False)
+        problem.nn_lyapunov.load_state_dict(ckpt["model_state"])
+        print(f"Checkpoint loaded: {path}")
+
+    device = torch.device(args.device)
+    problem.to(device)
+
+    n_params = sum(p.numel() for p in problem.nn_lyapunov.parameters())
+    hidden_size = getattr(problem.nn_lyapunov, "hidden_size", "?")
+    print(f"Problem:      {problem}")
+    print(f"Lyapunov net: hidden_size={hidden_size}  params={n_params:,}")
+    print(f"Device:       {device}")
+    print(
+        f"Config:       early_exit={args.early_exit}  max_workers={args.max_workers}  hole={problem.hole}"
+    )
+    print()
+
+    problem.to("cpu")
+    origin_cexs, spatial_cexs, polygons, raw = _run_verify(problem, "Verification")
+
+    slug = _problem_slug(problem)
+    output_dir = args.output_dir
+
+    _write_cex_csv(
+        os.path.join(output_dir, f"{slug}_counterexamples.csv"),
+        raw,
+        problem.state_dim,
+    )
+    plot_verification(
+        output_dir,
+        f"{slug}_verification.png",
+        problem,
+        origin_cexs + spatial_cexs,
+        polygons,
+        args.grid_pts,
+        f"{type(problem).__name__}: polygon tessellation + counterexamples",
+    )
+
+
+def cmd_train(args):
     # ── Load problem ──────────────────────────────────────────────────────────
     mod = load_problem_module(args.problem_file)
     kwargs = {}
@@ -340,8 +453,8 @@ def main():
         kwargs["hidden_size"] = args.hidden_size
     problem = mod.make_problem(**kwargs)
 
-    if args.early_exit:
-        problem.early_exit = True
+    problem.early_exit = args.early_exit
+    problem.max_workers = args.max_workers
     if args.hole is not None:
         problem.hole = args.hole
 
@@ -352,7 +465,7 @@ def main():
     else:
         checkpoint_dir = args.checkpoint_dir
     os.makedirs(checkpoint_dir, exist_ok=True)
-    cex_log = os.path.join(checkpoint_dir, "counterexample_log.csv")
+    verify_log = os.path.join(checkpoint_dir, "verification_log.jsonl")
 
     device = torch.device(args.device)
 
@@ -367,9 +480,8 @@ def main():
     print(
         f"Config:         epochs={args.epochs}  lr={args.lr}  grid={args.grid_pts}"
         f"  retrain_lr={args.retrain_lr}  cex_weight={args.cex_weight}"
-        f"  epsilon={args.epsilon}  cex_window={args.cex_window}"
-        f"  max_iter={args.max_iterations}"
-        f"  early_exit={args.early_exit}  hole={problem.hole}"
+        f"  cex_window={args.cex_window}  max_iter={args.max_iterations}"
+        f"  early_exit={args.early_exit}  max_workers={args.max_workers}  hole={problem.hole}"
     )
     print()
 
@@ -390,98 +502,63 @@ def main():
 
     # ── Initial verification ──────────────────────────────────────────────────
     problem.to("cpu")
-    origin_cexs, spatial_cexs, polygons = _unpack_verify(problem.verify(), args.epsilon)
-    all_cexs = origin_cexs + spatial_cexs
-    _print_verify_summary(origin_cexs, spatial_cexs, label="Initial verification")
-
+    origin_cexs, spatial_cexs, polygons, raw_initial = _run_verify(
+        problem, "Initial verification"
+    )
+    _write_cex_csv(
+        os.path.join(checkpoint_dir, "initial_counterexamples.csv"),
+        raw_initial,
+        problem.state_dim,
+    )
     plot_verification(
         checkpoint_dir,
         "initial_verification.png",
         problem,
-        all_cexs,
+        origin_cexs + spatial_cexs,
         polygons,
         args.grid_pts,
         "Hyperplane verification: polygon tessellation + counterexamples",
     )
 
-    # ── Build base grid for retraining ────────────────────────────────────────
-    region_np = problem.region.numpy()
-    linspaces = [
-        np.linspace(region_np[d, 0], region_np[d, 1], args.grid_pts)
-        for d in range(problem.state_dim)
-    ]
-    mesh = np.meshgrid(*linspaces, indexing="ij")
-    base_grid = torch.tensor(
-        np.stack([m.ravel() for m in mesh], axis=1), dtype=torch.float32
+    base_grid = _build_base_grid(problem, args.grid_pts)
+    start_iteration, cex_history = _find_resume_point(
+        checkpoint_dir, args.max_iterations, problem
     )
 
-    # ── Verification loop ────────────────────────────────────────────────────
-    cex_history: list[list[tuple]] = []
-    start_iteration = 0
-
-    for resume_i in range(args.max_iterations - 1, -1, -1):
-        ckpt = load_checkpoint(checkpoint_dir, f"iter_{resume_i}")
-        if ckpt is not None:
-            problem.nn_lyapunov.load_state_dict(ckpt["model_state"])
-            cex_history = ckpt.get("cex_history", [])
-            start_iteration = resume_i + 1
-            print(f"Resuming from iteration {start_iteration}")
-            break
-
+    # ── Verification / retrain loop ───────────────────────────────────────────
     for i in range(start_iteration, args.max_iterations):
         start = time.time()
         problem.to("cpu")
-        origin_cexs, spatial_cexs, _ = _unpack_verify(problem.verify(), args.epsilon)
-        all_iter_cexs = origin_cexs + spatial_cexs
-        _print_verify_summary(origin_cexs, spatial_cexs, label=f"Iteration {i}")
-        cex_history.append(all_iter_cexs)
+        origin_cexs, spatial_cexs, _, raw = _run_verify(problem, f"Iteration {i}")
+        _write_cex_csv(
+            os.path.join(checkpoint_dir, f"iter_{i}_counterexamples.csv"),
+            raw,
+            problem.state_dim,
+        )
+        cexs = origin_cexs + spatial_cexs
+        cex_history.append(cexs)
 
-        if len(all_iter_cexs) == 0:
+        if not cexs:
             print("No counterexamples — done.")
             break
 
-        append_cex_log(cex_log, i, all_iter_cexs)
+        append_verify_log(verify_log, i, raw)
 
-        # Sliding window
-        window: list[tuple] = []
-        for h in cex_history[-args.cex_window :]:
-            window.extend(h)
+        window = [p for h in cex_history[-args.cex_window :] for p in h]
         print(
             f"  {len(window)} counterexamples in training window "
             f"(last {args.cex_window} iters)."
         )
 
-        cex_xy = [p[:-1] for p in window]
-        cex_tensor = torch.tensor(cex_xy, dtype=torch.float32)
-        problem.to(device)
-        grid_dev = base_grid.to(device)
-        cex_dev = cex_tensor.to(device)
-
-        optimizer = torch.optim.Adam(
-            problem.nn_lyapunov.parameters(), lr=args.retrain_lr
+        _retrain(
+            problem,
+            base_grid,
+            window,
+            args.epochs,
+            args.retrain_lr,
+            args.cex_weight,
+            device,
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=1e-5
-        )
-        for epoch in range(args.epochs):
-            problem.nn_lyapunov.train()
-            optimizer.zero_grad()
-            loss_grid = lyapunov_loss_function(
-                grid_dev.clone(), problem.nn_lyapunov, problem.dynamics
-            )
-            loss_cex = lyapunov_loss_function(
-                cex_dev.clone(), problem.nn_lyapunov, problem.dynamics
-            )
-            loss = loss_grid + args.cex_weight * loss_cex
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-            if (epoch + 1) % 100 == 0:
-                print(
-                    f"  retrain epoch [{epoch + 1}/{args.epochs}]  "
-                    f"grid={loss_grid.item():.4f}  cex={loss_cex.item():.4f}"
-                )
-
         print(f"Iteration {i} completed in {time.time() - start:.2f}s\n")
         save_checkpoint(
             checkpoint_dir,
@@ -493,23 +570,126 @@ def main():
 
     # ── Final verification ────────────────────────────────────────────────────
     problem.to("cpu")
-    origin_cexs, spatial_cexs, final_polygons = _unpack_verify(
-        problem.verify(), args.epsilon
+    origin_cexs, spatial_cexs, final_polygons, raw_final = _run_verify(
+        problem, "Final verification"
     )
-    final_cexs = origin_cexs + spatial_cexs
-    _print_verify_summary(origin_cexs, spatial_cexs, label="Final verification")
-
+    _write_cex_csv(
+        os.path.join(checkpoint_dir, "final_counterexamples.csv"),
+        raw_final,
+        problem.state_dim,
+    )
     plot_verification(
         checkpoint_dir,
         "final_verification.png",
         problem,
-        final_cexs,
+        origin_cexs + spatial_cexs,
         final_polygons,
         args.grid_pts,
         "Final verification: polygon tessellation + counterexamples",
     )
-
     plot_cex_history(checkpoint_dir, cex_history, problem)
+
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+
+def _add_common_args(parser: argparse.ArgumentParser):
+    """Args shared between verify and train."""
+    parser.add_argument(
+        "problem_file",
+        help="Path to a Python file defining make_problem() -> LyapunovProblem",
+    )
+    parser.add_argument("--device", default="cpu", help="torch device (cpu, cuda, mps)")
+    parser.add_argument(
+        "--early-exit",
+        action="store_true",
+        default=False,
+        help="Stop verification after the first failing condition",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help="Max worker processes for per-cell Lie derivative checks",
+    )
+    parser.add_argument(
+        "--hole",
+        type=float,
+        default=None,
+        help="Exclusion radius around origin: positivity and decrease counterexamples within this ball are not required (default: 1e-6)",
+    )
+    parser.add_argument(
+        "--hidden-size",
+        type=int,
+        default=None,
+        help="Override hidden layer size in the Lyapunov net",
+    )
+    parser.add_argument("--grid-pts", type=int, default=300)
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show per-cell certified lines during verification",
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ReLU Lyapunov function training and verification"
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    # ── verify ────────────────────────────────────────────────────────────────
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="Run only the verification pipeline on an existing trained model",
+    )
+    _add_common_args(verify_parser)
+    verify_parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Path to a .pt checkpoint file to load before verifying",
+    )
+    verify_parser.add_argument(
+        "--output-dir",
+        default=".",
+        help="Directory for output files (default: current working directory)",
+    )
+
+    # ── train ─────────────────────────────────────────────────────────────────
+    train_parser = subparsers.add_parser(
+        "train",
+        help="Train a Lyapunov network and run the verify/retrain loop",
+    )
+    _add_common_args(train_parser)
+    train_parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="Directory for checkpoints (default: checkpoints_<problem_name>)",
+    )
+    train_parser.add_argument("--max-iterations", type=int, default=5)
+    train_parser.add_argument("--epochs", type=int, default=800)
+    train_parser.add_argument(
+        "--lr", type=float, default=1e-3, help="Initial training LR"
+    )
+    train_parser.add_argument("--retrain-lr", type=float, default=4e-4)
+    train_parser.add_argument("--cex-weight", type=float, default=10.0)
+    train_parser.add_argument(
+        "--cex-window",
+        type=int,
+        default=3,
+        help="Retrain on current + this many prior iterations",
+    )
+
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    logging.getLogger("relu_vnn").setLevel(
+        logging.DEBUG if args.verbose else logging.INFO
+    )
+    if args.subcommand == "verify":
+        cmd_verify(args)
+    else:
+        cmd_train(args)
 
 
 if __name__ == "__main__":

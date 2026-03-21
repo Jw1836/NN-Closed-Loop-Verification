@@ -8,14 +8,16 @@ Pipeline:
   2. align_basis / check_decrease  - rotate cell, verify Lie derivative per cell
 """
 
+import logging
 from collections import deque
-
 import numpy as np
 import torch
 from scipy.optimize import linprog
 from scipy.spatial import HalfspaceIntersection
 from typing import Sequence, cast
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 # float32 numerical tolerance (~10× machine epsilon)
 EPS: float = 1e-6
@@ -118,7 +120,7 @@ def find_chebyshev_center(halfspaces: np.ndarray) -> np.ndarray | None:
         bounds=[(None, None)] * state_dim + [(0, None)],
         method="highs",
     )
-    if result.success and result.x[-1] > EPS:
+    if result.success and result.x[-1] > 0:
         return result.x[:state_dim]
     return None
 
@@ -132,10 +134,10 @@ def enumerate_cells_bfs(
     """Enumerate all non-empty cells of the ReLU hyperplane arrangement via BFS.
 
     Each hidden neuron defines a hyperplane ``w_i · x + b_i = 0`` that splits
-    the domain into two half-spaces.  A *cell* is the intersection of one
-    half-space per neuron (the "activation pattern") with the bounding box —
-    i.e. the region where a specific set of ReLUs are on/off.  Within each
-    cell the network is affine, so ``∇V`` is constant.
+    the domain into two half-spaces.  A *cell* is the convex polytope formed
+    by the intersection of one half-space per neuron (the "activation pattern")
+    with the bounding box — i.e. the region where a specific set of ReLUs are on/off.
+    Within each cell the network is affine, so ``∇V`` is constant.
 
     In 2-D with *n* hyperplanes there are at most ``O(n²)`` non-empty cells
     (arrangement complexity theorem), so BFS is tractable even though the
@@ -161,10 +163,22 @@ def enumerate_cells_bfs(
     center = region.mean(axis=1)
     sigma_0 = compute_activation_pattern(W_matrix, B_vector, center)
 
+    # BFS invariant: `visited` contains every activation pattern that has ever
+    # been enqueued, so each pattern is processed at most once.  Completeness
+    # relies on the hyperplane arrangement graph being connected within the
+    # bounding box — every non-empty cell shares at least one facet (a tight
+    # ReLU hyperplane) with another cell, so BFS from any seed reaches all of
+    # them.
     visited: set[ActivationPattern] = {sigma_0}
     queue: deque[tuple[ActivationPattern, np.ndarray]] = deque([(sigma_0, center)])
     cells: list[HalfspaceIntersection] = []
+    total_volume = 0.0  # accumulated for the sanity check at the end
 
+    # `is_seed` enables diagnostic printing only for the very first cell.
+    # If the seed cell is skipped, something is likely wrong with the network
+    # or domain configuration, so we emit a warning.  After the seed, skipped
+    # cells are expected (BFS explores candidate neighbors that may be empty).
+    is_seed = True
     while queue:
         sigma, hint = queue.popleft()
 
@@ -184,6 +198,16 @@ def enumerate_cells_bfs(
             # (activation pattern has no realizable region in the domain).
             interior = find_chebyshev_center(hs)
             if interior is None:
+                # Skipping infeasible / degenerate cells does not break
+                # completeness: an infeasible pattern has no realizable region
+                # in the domain (it was a candidate neighbor that turned out
+                # empty).  A zero-volume cell has no interior and therefore no
+                # tight hyperplanes that could lead to undiscovered neighbors.
+                if is_seed:
+                    logger.warning(
+                        "[BFS seed] Chebyshev center LP infeasible — seed cell skipped"
+                    )
+                is_seed = False
                 continue
 
         # --- Compute cell vertices ---
@@ -193,7 +217,10 @@ def enumerate_cells_bfs(
                 interior,
                 incremental=False,
             )
-        except QhullError:
+        except QhullError as e:
+            if is_seed:
+                logger.warning("[BFS seed] QhullError in HalfspaceIntersection: %s", e)
+            is_seed = False
             continue  # degenerate (e.g. numerically flat cell)
 
         raw_verts = hs_obj.intersections
@@ -201,21 +228,40 @@ def enumerate_cells_bfs(
         # HalfspaceIntersection can return duplicate or near-collinear points.
         # ConvexHull filters these and gives vertices in CCW order.
         if len(raw_verts) < state_dim + 1:
+            if is_seed:
+                logger.warning(
+                    "[BFS seed] too few raw vertices: %d < %d",
+                    len(raw_verts),
+                    state_dim + 1,
+                )
+            is_seed = False
             continue
         try:
             hull = ConvexHull(raw_verts, incremental=False)
-        except QhullError:
+        except QhullError as e:
+            if is_seed:
+                logger.warning("[BFS seed] QhullError in ConvexHull: %s", e)
+            is_seed = False
             continue  # degenerate (collinear points, etc.)
         if len(hull.vertices) < state_dim + 1:
+            if is_seed:
+                logger.warning(
+                    "[BFS seed] too few hull vertices: %d < %d",
+                    len(hull.vertices),
+                    state_dim + 1,
+                )
+            is_seed = False
             continue
 
         cells.append(hs_obj)
+        total_volume += hull.volume
 
         # --- Discover neighboring cells ---
-        # A ReLU hyperplane is "tight" if at least one vertex of this cell
-        # lies on it (|w_i · v + b_i| < tol).  Flipping that neuron's
-        # activation bit gives the adjacent cell on the other side.
-        # Vectorized: evaluate all n hyperplanes at all k vertices at once.
+        # Evaluate all neuron pre-activations w_i · v + b_i at every vertex.
+        # A hyperplane is "tight" if any vertex has |pre-activation| < EPS,
+        # meaning the cell shares a facet with the cell on the other side of
+        # that hyperplane — this is the adjacency condition in the arrangement
+        # graph.  Vectorized: all n hyperplanes × all k vertices at once.
         ordered_verts = raw_verts[hull.vertices]
         all_values = ordered_verts @ W_matrix + B_vector  # (k, n_hidden)
         tight_mask = np.any(np.abs(all_values) < EPS, axis=0)  # (n_hidden,)
@@ -227,14 +273,33 @@ def enumerate_cells_bfs(
             neighbor_pat = tuple(neighbor)
             if neighbor_pat not in visited:
                 visited.add(neighbor_pat)
-                # Reflect interior across hyperplane i as a hint for the
-                # neighbor's interior point, avoiding an LP solve if it
-                # lands strictly inside the neighbor cell.
+                # Reflect interior across hyperplane i: x' = x - 2·((w·x+b)/(w·w))·w.
+                # Since `interior` is strictly inside the current cell, the
+                # reflected point typically lands strictly inside the neighbor
+                # cell on the other side of hyperplane i.  This provides a
+                # "free" interior point, avoiding the expensive Chebyshev LP.
                 w = W_matrix[:, i]
                 b = B_vector[i]
                 dist = (w @ interior + b) / (w @ w)
                 neighbor_hint = interior - 2 * dist * w
                 queue.append((neighbor_pat, neighbor_hint))
+
+    # ── Sanity check: cells must tile the bounding box exactly ──────────────
+    # If the cells partition the domain correctly, their volumes must sum to
+    # the bounding-box volume.  A shortfall means cells were missed; an excess
+    # means cells overlap.  Either way, verification results would be unsound.
+    bbox_volume = float(np.prod(region[:, 1] - region[:, 0]))
+    rel_error = (
+        abs(total_volume - bbox_volume) / bbox_volume if bbox_volume > 0 else 0.0
+    )
+    if rel_error > 1e-6:
+        raise RuntimeError(
+            f"Cell enumeration volume mismatch: "
+            f"sum(cell volumes)={total_volume:.8g} vs "
+            f"bbox volume={bbox_volume:.8g} "
+            f"(relative error={rel_error:.2e}). "
+            f"This indicates missing or overlapping cells."
+        )
 
     return cells
 
