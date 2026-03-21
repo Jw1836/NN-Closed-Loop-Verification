@@ -217,7 +217,7 @@ def enumerate_cells_bfs(
                 # empty).  A zero-volume cell has no interior and therefore no
                 # tight hyperplanes that could lead to undiscovered neighbors.
                 if is_seed:
-                    logger.warning(
+                    logger.debug(
                         "[BFS seed] Chebyshev center LP infeasible — seed cell skipped"
                     )
                 is_seed = False
@@ -242,7 +242,7 @@ def enumerate_cells_bfs(
         # ConvexHull filters these and gives vertices in CCW order.
         if len(raw_verts) < state_dim + 1:
             if is_seed:
-                logger.warning(
+                logger.debug(
                     "[BFS seed] too few raw vertices: %d < %d",
                     len(raw_verts),
                     state_dim + 1,
@@ -258,7 +258,7 @@ def enumerate_cells_bfs(
             continue  # degenerate (collinear points, etc.)
         if len(hull.vertices) < state_dim + 1:
             if is_seed:
-                logger.warning(
+                logger.debug(
                     "[BFS seed] too few hull vertices: %d < %d",
                     len(hull.vertices),
                     state_dim + 1,
