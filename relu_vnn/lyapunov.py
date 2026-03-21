@@ -13,7 +13,7 @@ from scipy.spatial import HalfspaceIntersection
 from relu_vnn.hyperplane import EPS
 
 
-def _check_cell_lie(args):
+def _check_cell_lie(args) -> dict[str, object]:
     """Module-level worker for per-cell Lie derivative check.
 
     Must be top-level for pickling with multiprocessing.
@@ -222,26 +222,32 @@ class LyapunovProblem:
         self.dynamics.to(device)
         return self
 
-    def check_origin(self) -> np.ndarray | None:
+    def check_origin(self) -> dict:
         """Check that V(0) = 0 (first Lyapunov condition).
 
-        Returns None if the condition holds, or a 2-D array of shape
-        (1, state_dim+1) with row [x1, ..., xn, V(0)] if the condition fails.
+        Returns a dict with keys:
+            "passed"          — True if V(0) ≈ 0
+            "v0"              — float, the actual value V(0)
+            "counterexamples" — None if passed, else [[0, ..., 0, v0]]
         """
         origin = torch.zeros(1, self.state_dim, device=self.device)
         v0 = float(self.nn_lyapunov(origin).item())
-        if np.isclose(v0, 0.0):
-            return None
-        # Return 2-D array (1, state_dim+1) for consistency with other checks
-        return np.array([[*([0.0] * self.state_dim), v0]])
+        passed = bool(np.isclose(v0, 0.0))
+        return {
+            "passed": passed,
+            "v0": v0,
+            "counterexamples": None if passed else [[*([0.0] * self.state_dim), v0]],
+        }
 
-    def check_positive(self, H: list[HalfspaceIntersection]) -> np.ndarray | None:
+    def check_positive(self, H: list[HalfspaceIntersection]) -> dict:
         """Check that V(x) > 0 for all x in region, except the origin (second Lyapunov condition).
 
         Only checks convex hull vertices. Vertices within self.hole of the origin are skipped.
 
-        Returns None if the condition holds, or a 2-D array with each row
-        [x1, ..., xn, V(x)] indicating a violation.
+        Returns a dict with keys:
+            "passed"          — True if no violations found
+            "n_violations"    — int, number of violating vertices
+            "counterexamples" — None if passed, else list of rows [x1, ..., xn, V(x)]
         """
         all_verts = np.concatenate([cell.intersections for cell in H], axis=0)
         norms = np.linalg.norm(all_verts, axis=1)
@@ -249,27 +255,32 @@ class LyapunovProblem:
 
         if len(all_verts) == 0:
             print("Warning: all vertices at origin. Skipping.")
-            return None
+            return {"passed": True, "n_violations": 0, "counterexamples": None}
 
         x = torch.tensor(all_verts, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             v = self.nn_lyapunov(x).squeeze(1).cpu().numpy()  # (N,)
 
         violations_mask = v <= 0.0
-        if not np.any(violations_mask):
-            return None
+        n_violations = int(np.sum(violations_mask))
+        if n_violations == 0:
+            return {"passed": True, "n_violations": 0, "counterexamples": None}
 
         violating_verts = all_verts[violations_mask]
         violating_v = v[violations_mask]
         cex = np.concatenate([violating_verts, violating_v[:, None]], axis=1)
 
-        return cex
+        return {
+            "passed": False,
+            "n_violations": n_violations,
+            "counterexamples": cex.tolist(),
+        }
 
     def check_decrease(
         self,
         cells: list[HalfspaceIntersection],
         callback=None,
-    ) -> np.ndarray | None:
+    ) -> dict:
         """Check that ∇V(x)·f(x) < 0 everywhere except the origin (third Lyapunov condition).
 
         Args:
@@ -379,7 +390,14 @@ class LyapunovProblem:
             f"check_decrease done: {n_certified}/{n_cells} certified, "
             f"{n_violated}/{n_cells} violated"
         )
-        return None if not violations else np.vstack(violations)
+        cex_array = np.vstack(violations) if violations else None
+        return {
+            "passed": cex_array is None,
+            "n_cells": n_cells,
+            "n_certified": n_certified,
+            "n_violations": n_violated,
+            "counterexamples": cex_array.tolist() if cex_array is not None else None,
+        }
 
     def enumerate_cells(self) -> list[HalfspaceIntersection]:
         """Build the ReLU activation-pattern cell decomposition for this network and region."""
@@ -402,17 +420,20 @@ class LyapunovProblem:
         print(f"  done ({time.perf_counter() - t0:.3f}s)  — {len(cells)} cells")
         return cells
 
-    def verify(self) -> dict[str, np.ndarray | list[HalfspaceIntersection] | None]:
+    def verify(self) -> dict:
         """Run all three Lyapunov checks.
 
         Returns a dict with keys:
-            "origin"   — None if V(0)=0 holds, else ndarray [x1,...,xn, V(0)]
-            "positive" — None if V(x)>0 holds, else ndarray of violation rows
-            "decrease" — None if V_dot<0 holds, else ndarray of violation rows
-            "cells"    — list[HalfspaceIntersection], the set of convex polytopes
+            "n_cells"  — int, number of cells in the ReLU partition (0 if early exit)
+            "cells"    — list[HalfspaceIntersection] (empty if early exit)
+            "origin"   — result dict from check_origin() (always present)
+            "positive" — result dict from check_positive(), or None if skipped
+            "decrease" — result dict from check_decrease(), or None if skipped
         """
 
-        results: dict[str, np.ndarray | list[HalfspaceIntersection] | None] = {
+        results: dict = {
+            "n_cells": 0,
+            "cells": [],
             "origin": None,
             "positive": None,
             "decrease": None,
@@ -423,8 +444,8 @@ class LyapunovProblem:
         t0 = time.perf_counter()
         results["origin"] = self.check_origin()
         print(f"  done ({time.perf_counter() - t0:.3f}s)")
-        if (cex := results["origin"]) is not None:
-            print(f"Found {len(cex)} counterexamples.")
+        if not results["origin"]["passed"]:
+            print(f"Origin violation: V(0) = {results['origin']['v0']:.6g}")
             if self.early_exit:
                 print("Violation found! Exiting early.")
                 return results
@@ -433,14 +454,16 @@ class LyapunovProblem:
 
         # Build the cell decomposition for the next two checks.
         cells = self.enumerate_cells()
+        results["n_cells"] = len(cells)
+        results["cells"] = cells
 
         # Criteria 2: V(x) > 0
         print("Checking positive condition...")
         t0 = time.perf_counter()
         results["positive"] = self.check_positive(cells)
         print(f"  done ({time.perf_counter() - t0:.3f}s)")
-        if (cex := results["positive"]) is not None:
-            print(f"Found {len(cex)} counterexamples.")
+        if not results["positive"]["passed"]:
+            print(f"Found {results['positive']['n_violations']} counterexamples.")
             if self.early_exit:
                 print("Violation found! Exiting early.")
                 return results
@@ -452,25 +475,24 @@ class LyapunovProblem:
         t0 = time.perf_counter()
         results["decrease"] = self.check_decrease(cells)
         print(f"  done ({time.perf_counter() - t0:.3f}s)")
-        if (cex := results["decrease"]) is not None:
-            print(f"Found {len(cex)} counterexamples.")
-            if self.early_exit:
-                print("Violation found! Exiting early.")
-                return results
+        if not results["decrease"]["passed"]:
+            print(f"Found {results['decrease']['n_violations']} counterexamples.")
         else:
             print("Check passed!")
-
-        # Return even if all checks pass; good for plots or analysis.
-        results["cells"] = cells
 
         print("Verification complete.")
         print("Summary of results:")
         for key in ["origin", "positive", "decrease"]:
-            if results[key] is None:
+            r = results[key]
+            if r is None:
+                print(f"  {key}: skipped")
+            elif r["passed"]:
                 print(f"  {key}: PASSED")
+            elif key == "origin":
+                print(f"  {key}: FAILED (V(0) = {r['v0']:.6g})")
             else:
-                print(f"  {key}: FAILED with {len(results[key])} counterexamples")  # type: ignore
-        print(f"  cells: {len(results['cells'])} returned.")
+                print(f"  {key}: FAILED with {r['n_violations']} counterexamples")
+        print(f"  cells: {results['n_cells']} returned.")
         return results
 
     def __repr__(self) -> str:

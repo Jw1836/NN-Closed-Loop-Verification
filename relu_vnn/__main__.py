@@ -12,8 +12,8 @@ Example:
 """
 
 import argparse
-import csv
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -57,15 +57,21 @@ def load_checkpoint(checkpoint_dir: str, tag: str):
     return None
 
 
-def append_cex_log(cex_log_path: str, iteration: int, cexs: list[tuple]):
-    write_header = not os.path.exists(cex_log_path)
-    with open(cex_log_path, "a", newline="") as f:
-        writer = csv.writer(f)
-        if write_header:
-            state_cols = [f"x{i + 1}" for i in range(len(cexs[0]) - 1)]
-            writer.writerow(["iteration"] + state_cols + ["dVx"])
-        for p in cexs:
-            writer.writerow([iteration] + list(p))
+def append_verify_log(log_path: str, iteration: int, verify_results: dict):
+    """Append one JSONL entry per iteration to the verification log."""
+    entry: dict = {"iteration": iteration, "timestamp": time.time()}
+    for key in ("n_cells", "origin", "positive", "decrease"):
+        val = verify_results.get(key)
+        if isinstance(val, dict):
+            # Exclude large counterexample lists from the summary log
+            entry[key] = {k: v for k, v in val.items() if k != "counterexamples"}
+            entry[key]["n_counterexamples"] = (
+                len(val["counterexamples"]) if val["counterexamples"] is not None else 0
+            )
+        else:
+            entry[key] = val
+    with open(log_path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
 # ── Problem loader ────────────────────────────────────────────────────────────
@@ -121,15 +127,15 @@ def _unpack_verify(
     spatial_cexs: list[tuple] = []
     n_filtered = 0
 
-    arr = results["origin"]
-    if arr is not None:
-        for row in np.atleast_2d(arr):
+    origin = results["origin"]
+    if origin is not None and not origin["passed"]:
+        for row in (origin["counterexamples"] or []):
             origin_cexs.append(tuple(float(v) for v in row))
 
     for key in ("positive", "decrease"):
-        arr = results[key]
-        if arr is not None:
-            for row in np.atleast_2d(arr):
+        check = results[key]
+        if check is not None and not check["passed"]:
+            for row in (check["counterexamples"] or []):
                 pt = tuple(float(v) for v in row)
                 dist_sq = sum(v**2 for v in pt[:-1])
                 if dist_sq >= epsilon**2:
@@ -163,11 +169,12 @@ def _print_verify_summary(
 
 def _run_verify(
     problem: LyapunovProblem, epsilon: float, label: str
-) -> tuple[list[tuple], list[tuple], list[list]]:
-    """Verify, print summary, and return (origin_cexs, spatial_cexs, cell_coords)."""
-    origin_cexs, spatial_cexs, cell_coords = _unpack_verify(problem.verify(), epsilon)
+) -> tuple[list[tuple], list[tuple], list[list], dict]:
+    """Verify, print summary, and return (origin_cexs, spatial_cexs, cell_coords, raw_results)."""
+    raw = problem.verify()
+    origin_cexs, spatial_cexs, cell_coords = _unpack_verify(raw, epsilon)
     _print_verify_summary(origin_cexs, spatial_cexs, label=label)
-    return origin_cexs, spatial_cexs, cell_coords
+    return origin_cexs, spatial_cexs, cell_coords, raw
 
 
 # ── Training helpers ──────────────────────────────────────────────────────────
@@ -442,7 +449,7 @@ def main():
     else:
         checkpoint_dir = args.checkpoint_dir
     os.makedirs(checkpoint_dir, exist_ok=True)
-    cex_log = os.path.join(checkpoint_dir, "counterexample_log.csv")
+    verify_log = os.path.join(checkpoint_dir, "verification_log.jsonl")
 
     device = torch.device(args.device)
 
@@ -480,7 +487,7 @@ def main():
 
     # ── Initial verification ──────────────────────────────────────────────────
     problem.to("cpu")
-    origin_cexs, spatial_cexs, polygons = _run_verify(
+    origin_cexs, spatial_cexs, polygons, _ = _run_verify(
         problem, args.epsilon, "Initial verification"
     )
     plot_verification(
@@ -502,7 +509,7 @@ def main():
     for i in range(start_iteration, args.max_iterations):
         start = time.time()
         problem.to("cpu")
-        origin_cexs, spatial_cexs, _ = _run_verify(
+        origin_cexs, spatial_cexs, _, raw = _run_verify(
             problem, args.epsilon, f"Iteration {i}"
         )
         cexs = origin_cexs + spatial_cexs
@@ -512,7 +519,7 @@ def main():
             print("No counterexamples — done.")
             break
 
-        append_cex_log(cex_log, i, cexs)
+        append_verify_log(verify_log, i, raw)
 
         window = [p for h in cex_history[-args.cex_window :] for p in h]
         print(
@@ -540,7 +547,7 @@ def main():
 
     # ── Final verification ────────────────────────────────────────────────────
     problem.to("cpu")
-    origin_cexs, spatial_cexs, final_polygons = _run_verify(
+    origin_cexs, spatial_cexs, final_polygons, _ = _run_verify(
         problem, args.epsilon, "Final verification"
     )
     plot_verification(
