@@ -8,6 +8,7 @@ Pipeline:
   2. align_basis / check_decrease  - rotate cell, verify Lie derivative per cell
 """
 
+import itertools
 import logging
 from collections import deque
 import numpy as np
@@ -120,7 +121,7 @@ def find_chebyshev_center(halfspaces: np.ndarray) -> np.ndarray | None:
         bounds=[(None, None)] * state_dim + [(0, None)],
         method="highs",
     )
-    if result.success and result.x[-1] > 0:
+    if result.success and result.x[-1] > EPS:
         return result.x[:state_dim]
     return None
 
@@ -158,10 +159,17 @@ def enumerate_cells_bfs(
     """
     from scipy.spatial import ConvexHull, QhullError
 
-    # Seed the BFS from the domain center
+    # Seed the BFS from the domain center plus offset points at ±25% of each
+    # dimension's range.  Multiple seeds guard against the center landing in a
+    # near-degenerate cell (e.g. when many hyperplanes cluster near the origin
+    # after training), which would stall BFS with an empty queue.
     state_dim = region.shape[0]
     center = region.mean(axis=1)
-    sigma_0 = compute_activation_pattern(W_matrix, B_vector, center)
+    quarter = (region[:, 1] - region[:, 0]) * 0.25
+    seed_points = [center] + [
+        center + quarter * np.array(signs)
+        for signs in itertools.product([-1.0, 1.0], repeat=state_dim)
+    ]
 
     # BFS invariant: `visited` contains every activation pattern that has ever
     # been enqueued, so each pattern is processed at most once.  Completeness
@@ -169,8 +177,13 @@ def enumerate_cells_bfs(
     # bounding box — every non-empty cell shares at least one facet (a tight
     # ReLU hyperplane) with another cell, so BFS from any seed reaches all of
     # them.
-    visited: set[ActivationPattern] = {sigma_0}
-    queue: deque[tuple[ActivationPattern, np.ndarray]] = deque([(sigma_0, center)])
+    visited: set[ActivationPattern] = set()
+    queue: deque[tuple[ActivationPattern, np.ndarray]] = deque()
+    for pt in seed_points:
+        sigma = compute_activation_pattern(W_matrix, B_vector, pt)
+        if sigma not in visited:
+            visited.add(sigma)
+            queue.append((sigma, pt))
     cells: list[HalfspaceIntersection] = []
     total_volume = 0.0  # accumulated for the sanity check at the end
 
