@@ -15,7 +15,13 @@ def problem():
 class TestVerify:
     def test_returns_expected_keys(self, problem):
         results = problem.verify()
-        assert set(results.keys()) >= {"origin", "positive", "decrease", "cells", "n_cells"}
+        assert set(results.keys()) >= {
+            "origin",
+            "positive",
+            "decrease",
+            "cells",
+            "n_cells",
+        }
 
     def test_cells_are_halfspace_intersections(self, problem):
         results = problem.verify()

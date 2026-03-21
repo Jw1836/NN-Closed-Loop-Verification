@@ -209,7 +209,9 @@ class LyapunovProblem:
         self.nn_lyapunov = nn_lyapunov
         self.dynamics = dynamics
         self.region = region
-        self.hole: float = EPS  # Hole around origin for numerical stability
+        self.hole: float = (
+            1e-6  # Exclusion radius around origin; problem-specific, not FP precision
+        )
         self.early_exit: bool = False
         self.max_workers: int = max_workers
 
@@ -241,7 +243,7 @@ class LyapunovProblem:
         """
         origin = torch.zeros(1, self.state_dim, device=self.device)
         v0 = float(self.nn_lyapunov(origin).item())
-        passed = bool(np.isclose(v0, 0.0))
+        passed = bool(np.isclose(v0, 0.0, atol=EPS))
         return {
             "passed": passed,
             "v0": v0,
@@ -259,6 +261,8 @@ class LyapunovProblem:
             "counterexamples" — None if passed, else list of rows [x1, ..., xn, V(x)]
         """
         all_verts = np.concatenate([cell.intersections for cell in H], axis=0)
+        # Round to FP32 precision before deduplication — adjacent cells share vertices
+        all_verts = np.unique(np.round(all_verts, 6), axis=0)
         norms = np.linalg.norm(all_verts, axis=1)
         all_verts = all_verts[norms >= self.hole]
 

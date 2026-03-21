@@ -1,20 +1,24 @@
 """Verification loop for ReLU Lyapunov functions.
 
 Usage:
-    python -m relu_vnn <problem_file.py> [options]
+    python -m relu_vnn train <problem_file.py> [options]
+    python -m relu_vnn verify <problem_file.py> [options]
 
 The problem file must define a `make_problem()` function that returns a
 LyapunovProblem instance.
 
 Example:
-    python -m relu_vnn problems/pendulum.py --hidden-size 30
-    python -m relu_vnn problems/duffing_oscillator.py --epochs 800
+    python -m relu_vnn train problems/pendulum.py --hidden-size 30
+    python -m relu_vnn train problems/duffing_oscillator.py --epochs 800
+    python -m relu_vnn verify problems/bilinear_oscillator.py --checkpoint checkpoints_bilinear_oscillator/iter_3.pt
 """
 
 import argparse
+import csv
 import importlib.util
 import json
 import os
+import re
 import sys
 import time
 
@@ -111,42 +115,28 @@ def load_problem_module(problem_path: str):
 
 
 def _unpack_verify(
-    results: dict, epsilon: float
+    results: dict,
 ) -> tuple[list[tuple], list[tuple], list[list]]:
     """Extract counterexamples from a verify() result dict.
 
-    Origin failures are never filtered (V(0)!=0 is a categorical failure).
-    Positivity/decrease counterexamples within *epsilon* of the origin are
-    filtered out (numerical noise near the equilibrium).
-
     Returns (origin_cexs, spatial_cexs, cell_coords).
+    The check_* methods in LyapunovProblem are responsible for any hole filtering.
     """
     from scipy.spatial import HalfspaceIntersection
 
     origin_cexs: list[tuple] = []
     spatial_cexs: list[tuple] = []
-    n_filtered = 0
 
     origin = results["origin"]
     if origin is not None and not origin["passed"]:
-        for row in (origin["counterexamples"] or []):
+        for row in origin["counterexamples"] or []:
             origin_cexs.append(tuple(float(v) for v in row))
 
     for key in ("positive", "decrease"):
         check = results[key]
         if check is not None and not check["passed"]:
-            for row in (check["counterexamples"] or []):
-                pt = tuple(float(v) for v in row)
-                dist_sq = sum(v**2 for v in pt[:-1])
-                if dist_sq >= epsilon**2:
-                    spatial_cexs.append(pt)
-                else:
-                    n_filtered += 1
-
-    if n_filtered > 0:
-        print(
-            f"  (filtered {n_filtered} counterexamples within epsilon={epsilon:.0e} of origin)"
-        )
+            for row in check["counterexamples"] or []:
+                spatial_cexs.append(tuple(float(v) for v in row))
 
     cells = cast(list[HalfspaceIntersection], results.get("cells", []))
     cell_coords = [cell.intersections.tolist() for cell in cells]
@@ -168,13 +158,38 @@ def _print_verify_summary(
 
 
 def _run_verify(
-    problem: LyapunovProblem, epsilon: float, label: str
+    problem: LyapunovProblem, label: str
 ) -> tuple[list[tuple], list[tuple], list[list], dict]:
     """Verify, print summary, and return (origin_cexs, spatial_cexs, cell_coords, raw_results)."""
     raw = problem.verify()
-    origin_cexs, spatial_cexs, cell_coords = _unpack_verify(raw, epsilon)
+    origin_cexs, spatial_cexs, cell_coords = _unpack_verify(raw)
     _print_verify_summary(origin_cexs, spatial_cexs, label=label)
     return origin_cexs, spatial_cexs, cell_coords, raw
+
+
+def _write_cex_csv(output_path: str, raw_results: dict, state_dim: int):
+    """Write counterexamples from all checks to a CSV file."""
+    rows = []
+    for check_type in ("origin", "positive", "decrease"):
+        check = raw_results.get(check_type)
+        if check is not None and not check["passed"]:
+            for row in check["counterexamples"] or []:
+                rows.append((check_type, *[float(v) for v in row]))
+
+    if not rows:
+        return
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["check"] + [f"x{i + 1}" for i in range(state_dim)] + ["value"])
+        writer.writerows(rows)
+    print(f"Counterexamples saved: {output_path}")
+
+
+def _problem_slug(problem: LyapunovProblem) -> str:
+    """Convert the problem class name to snake_case for use in filenames."""
+    name = type(problem).__name__
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
 
 # ── Training helpers ──────────────────────────────────────────────────────────
@@ -306,9 +321,10 @@ def plot_verification(
     ax.set_xlabel("x1")
     ax.set_ylabel("x2")
     plt.tight_layout()
-    fig.savefig(os.path.join(checkpoint_dir, filename), dpi=150)
+    save_path = os.path.join(checkpoint_dir, filename)
+    fig.savefig(save_path, dpi=150)
     plt.close(fig)
-    print(f"Plot saved: {checkpoint_dir}/{filename}")
+    print(f"Plot saved: {save_path}")
 
 
 def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem):
@@ -369,67 +385,66 @@ def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem)
     print(f"Plot saved: {checkpoint_dir}/cex_history.png")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Subcommands ───────────────────────────────────────────────────────────────
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Verification loop for ReLU Lyapunov functions"
-    )
-    parser.add_argument(
-        "problem_file",
-        help="Path to a Python file defining make_problem() -> LyapunovProblem",
-    )
-    parser.add_argument(
-        "--checkpoint-dir",
-        default=None,
-        help="Directory for checkpoints (default: checkpoints_<problem_name>)",
-    )
-    parser.add_argument("--max-iterations", type=int, default=5)
-    parser.add_argument("--epochs", type=int, default=800)
-    parser.add_argument("--lr", type=float, default=1e-3, help="Initial training LR")
-    parser.add_argument("--grid-pts", type=int, default=300)
-    parser.add_argument("--retrain-lr", type=float, default=4e-4)
-    parser.add_argument("--cex-weight", type=float, default=10.0)
-    parser.add_argument(
-        "--epsilon",
-        type=float,
-        default=1e-4,
-        help="Skip spatial counterexamples within this distance of origin",
-    )
-    parser.add_argument(
-        "--cex-window",
-        type=int,
-        default=3,
-        help="Retrain on current + this many prior iterations",
-    )
-    parser.add_argument(
-        "--hidden-size",
-        type=int,
-        default=None,
-        help="Override hidden layer size in the Lyapunov net",
-    )
-    parser.add_argument("--device", default="cpu", help="torch device (cpu or cuda)")
-    parser.add_argument(
-        "--early-exit",
-        action="store_true",
-        default=False,
-        help="Stop verification after the first failing condition",
-    )
-    parser.add_argument(
-        "--max-workers",
-        type=int,
-        default=1,
-        help="Max worker processes for per-cell Lie derivative checks (actual count = min(cells//4, max))",
-    )
-    parser.add_argument(
-        "--hole",
-        type=float,
-        default=None,
-        help="Hole radius around origin for positivity check (default: problem default)",
-    )
-    args = parser.parse_args()
+def cmd_verify(args):
+    mod = load_problem_module(args.problem_file)
+    kwargs = {}
+    if args.hidden_size is not None:
+        kwargs["hidden_size"] = args.hidden_size
+    problem = mod.make_problem(**kwargs)
 
+    problem.early_exit = args.early_exit
+    problem.max_workers = args.max_workers
+    if args.hole is not None:
+        problem.hole = args.hole
+
+    if args.checkpoint is not None:
+        path = args.checkpoint
+        if not os.path.isfile(path):
+            print(f"Error: checkpoint not found: {path}", file=sys.stderr)
+            sys.exit(1)
+        ckpt = torch.load(path, weights_only=False)
+        problem.nn_lyapunov.load_state_dict(ckpt["model_state"])
+        print(f"Checkpoint loaded: {path}")
+
+    device = torch.device(args.device)
+    problem.to(device)
+
+    n_params = sum(p.numel() for p in problem.nn_lyapunov.parameters())
+    hidden_size = getattr(problem.nn_lyapunov, "hidden_size", "?")
+    print(f"Problem:      {problem}")
+    print(f"Lyapunov net: hidden_size={hidden_size}  params={n_params:,}")
+    print(f"Device:       {device}")
+    print(
+        f"Config:       early_exit={args.early_exit}  max_workers={args.max_workers}  hole={problem.hole}"
+    )
+    print()
+
+    problem.to("cpu")
+    origin_cexs, spatial_cexs, polygons, raw = _run_verify(problem, "Verification")
+
+    slug = _problem_slug(problem)
+    output_dir = args.output_dir
+
+    _write_cex_csv(
+        os.path.join(output_dir, f"{slug}_counterexamples.csv"),
+        raw,
+        problem.state_dim,
+    )
+    plot_verification(
+        output_dir,
+        f"{slug}_verification.png",
+        problem,
+        origin_cexs + spatial_cexs,
+        polygons,
+        args.grid_pts,
+        f"{type(problem).__name__}: polygon tessellation + counterexamples",
+    )
+
+
+def cmd_train(args):
     # ── Load problem ──────────────────────────────────────────────────────────
     mod = load_problem_module(args.problem_file)
     kwargs = {}
@@ -464,8 +479,7 @@ def main():
     print(
         f"Config:         epochs={args.epochs}  lr={args.lr}  grid={args.grid_pts}"
         f"  retrain_lr={args.retrain_lr}  cex_weight={args.cex_weight}"
-        f"  epsilon={args.epsilon}  cex_window={args.cex_window}"
-        f"  max_iter={args.max_iterations}"
+        f"  cex_window={args.cex_window}  max_iter={args.max_iterations}"
         f"  early_exit={args.early_exit}  max_workers={args.max_workers}  hole={problem.hole}"
     )
     print()
@@ -487,8 +501,13 @@ def main():
 
     # ── Initial verification ──────────────────────────────────────────────────
     problem.to("cpu")
-    origin_cexs, spatial_cexs, polygons, _ = _run_verify(
-        problem, args.epsilon, "Initial verification"
+    origin_cexs, spatial_cexs, polygons, raw_initial = _run_verify(
+        problem, "Initial verification"
+    )
+    _write_cex_csv(
+        os.path.join(checkpoint_dir, "initial_counterexamples.csv"),
+        raw_initial,
+        problem.state_dim,
     )
     plot_verification(
         checkpoint_dir,
@@ -509,8 +528,11 @@ def main():
     for i in range(start_iteration, args.max_iterations):
         start = time.time()
         problem.to("cpu")
-        origin_cexs, spatial_cexs, _, raw = _run_verify(
-            problem, args.epsilon, f"Iteration {i}"
+        origin_cexs, spatial_cexs, _, raw = _run_verify(problem, f"Iteration {i}")
+        _write_cex_csv(
+            os.path.join(checkpoint_dir, f"iter_{i}_counterexamples.csv"),
+            raw,
+            problem.state_dim,
         )
         cexs = origin_cexs + spatial_cexs
         cex_history.append(cexs)
@@ -547,8 +569,13 @@ def main():
 
     # ── Final verification ────────────────────────────────────────────────────
     problem.to("cpu")
-    origin_cexs, spatial_cexs, final_polygons, _ = _run_verify(
-        problem, args.epsilon, "Final verification"
+    origin_cexs, spatial_cexs, final_polygons, raw_final = _run_verify(
+        problem, "Final verification"
+    )
+    _write_cex_csv(
+        os.path.join(checkpoint_dir, "final_counterexamples.csv"),
+        raw_final,
+        problem.state_dim,
     )
     plot_verification(
         checkpoint_dir,
@@ -560,6 +587,98 @@ def main():
         "Final verification: polygon tessellation + counterexamples",
     )
     plot_cex_history(checkpoint_dir, cex_history, problem)
+
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+
+def _add_common_args(parser: argparse.ArgumentParser):
+    """Args shared between verify and train."""
+    parser.add_argument(
+        "problem_file",
+        help="Path to a Python file defining make_problem() -> LyapunovProblem",
+    )
+    parser.add_argument("--device", default="cpu", help="torch device (cpu, cuda, mps)")
+    parser.add_argument(
+        "--early-exit",
+        action="store_true",
+        default=False,
+        help="Stop verification after the first failing condition",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help="Max worker processes for per-cell Lie derivative checks",
+    )
+    parser.add_argument(
+        "--hole",
+        type=float,
+        default=None,
+        help="Exclusion radius around origin: positivity and decrease counterexamples within this ball are not required (default: 1e-6)",
+    )
+    parser.add_argument(
+        "--hidden-size",
+        type=int,
+        default=None,
+        help="Override hidden layer size in the Lyapunov net",
+    )
+    parser.add_argument("--grid-pts", type=int, default=300)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ReLU Lyapunov function training and verification"
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    # ── verify ────────────────────────────────────────────────────────────────
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="Run only the verification pipeline on an existing trained model",
+    )
+    _add_common_args(verify_parser)
+    verify_parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Path to a .pt checkpoint file to load before verifying",
+    )
+    verify_parser.add_argument(
+        "--output-dir",
+        default=".",
+        help="Directory for output files (default: current working directory)",
+    )
+
+    # ── train ─────────────────────────────────────────────────────────────────
+    train_parser = subparsers.add_parser(
+        "train",
+        help="Train a Lyapunov network and run the verify/retrain loop",
+    )
+    _add_common_args(train_parser)
+    train_parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="Directory for checkpoints (default: checkpoints_<problem_name>)",
+    )
+    train_parser.add_argument("--max-iterations", type=int, default=5)
+    train_parser.add_argument("--epochs", type=int, default=800)
+    train_parser.add_argument(
+        "--lr", type=float, default=1e-3, help="Initial training LR"
+    )
+    train_parser.add_argument("--retrain-lr", type=float, default=4e-4)
+    train_parser.add_argument("--cex-weight", type=float, default=10.0)
+    train_parser.add_argument(
+        "--cex-window",
+        type=int,
+        default=3,
+        help="Retrain on current + this many prior iterations",
+    )
+
+    args = parser.parse_args()
+    if args.subcommand == "verify":
+        cmd_verify(args)
+    else:
+        cmd_train(args)
 
 
 if __name__ == "__main__":
