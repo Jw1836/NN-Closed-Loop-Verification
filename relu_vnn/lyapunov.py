@@ -208,23 +208,19 @@ class LyapunovProblem:
         dynamics: nn.Module,
         region: Tensor,
         max_workers: int = 1,
+        device: str | torch.device = "cpu",
     ) -> None:
         self.nn_lyapunov = nn_lyapunov
         self.dynamics = dynamics
         self.region = region
-        self.hole: float = (
-            1e-6  # Exclusion radius around origin; problem-specific, not FP precision
-        )
+        self.device = device
+        self.hole: float = 1e-6  # Exclusion radius around origin
         self.early_exit: bool = False
         self.max_workers: int = max_workers
 
     @property
     def state_dim(self) -> int:
         return self.region.shape[0]
-
-    @property
-    def device(self) -> torch.device:
-        return next(self.nn_lyapunov.parameters()).device
 
     def to(self, device: str | torch.device) -> "LyapunovProblem":
         """Move nn_lyapunov and dynamics to *device*.
@@ -234,6 +230,7 @@ class LyapunovProblem:
         """
         self.nn_lyapunov.to(device)
         self.dynamics.to(device)
+        self.device = device
         return self
 
     def check_origin(self) -> dict:
