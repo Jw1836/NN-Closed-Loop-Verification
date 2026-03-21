@@ -40,9 +40,10 @@ class BilinearLyapunov(nn.Module):
         self.network = nn.Sequential(
             nn.Linear(2, hidden_size), nn.ReLU(), nn.Linear(hidden_size, 1)
         )
+        self.register_buffer("shift", torch.tensor(0.0))
 
     def forward(self, x):
-        return self.network(x)  # shape (N, 1)
+        return self.network(x) - self.shift  # shape (N, 1)
 
 
 class BilinearProblem(LyapunovProblem):

@@ -5,7 +5,7 @@
 ### Train
 
 ```bash
-python -u -m relu_vnn train --checkpoint-dir /tmp/${RANDOM} --max-iterations 10 --epochs 600 --hidden-size 30 --device mps --max-workers 4 problems/bilinear_oscillator.py
+python -u -m relu_vnn train --checkpoint-dir runs/bilen_50it --max-iterations 50 --epochs 600 --hidden-size 30 --device mps --max-workers 4 problems/bilinear_oscillator.py
 ```
 
 ### Verify

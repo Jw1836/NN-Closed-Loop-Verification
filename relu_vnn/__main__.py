@@ -29,10 +29,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch import nn
 from typing import cast
 
-from .lyapunov import LyapunovProblem, lyapunov_loss_function, train_lyapunov_2d
+from .lyapunov import LyapunovProblem
+from .train import train_lyapunov_2d, build_base_grid, retrain
 
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
@@ -60,6 +60,18 @@ def load_checkpoint(checkpoint_dir: str, tag: str):
         print(f"Checkpoint loaded: {path}")
         return data
     return None
+
+
+def _load_model_state(model: torch.nn.Module, state_dict: dict):
+    """Load state_dict with strict=True, tolerating only a missing 'shift' key."""
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as e:
+        if "shift" in str(e):
+            print("Model does not have shift attribute. Loading strict=False")
+            model.load_state_dict(state_dict, strict=False)
+        else:
+            raise
 
 
 def append_verify_log(log_path: str, iteration: int, verify_results: dict):
@@ -193,68 +205,6 @@ def _problem_slug(problem: LyapunovProblem) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
 
-# ── Training helpers ──────────────────────────────────────────────────────────
-
-
-def _build_base_grid(problem: LyapunovProblem, grid_pts: int) -> torch.Tensor:
-    region_np = problem.region.numpy()
-    linspaces = [
-        np.linspace(region_np[d, 0], region_np[d, 1], grid_pts)
-        for d in range(problem.state_dim)
-    ]
-    mesh = np.meshgrid(*linspaces, indexing="ij")
-    return torch.tensor(
-        np.stack([m.ravel() for m in mesh], axis=1), dtype=torch.float32
-    )
-
-
-def _retrain(
-    problem: LyapunovProblem,
-    base_grid: torch.Tensor,
-    cexs: list[tuple],
-    epochs: int,
-    lr: float,
-    cex_weight: float,
-    device: torch.device,
-):
-    cex_tensor = torch.tensor([p[:-1] for p in cexs], dtype=torch.float32)
-    problem.to(device)
-    grid_dev = base_grid.to(device)
-    cex_dev = cex_tensor.to(device)
-
-    optimizer = torch.optim.Adam(problem.nn_lyapunov.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs, eta_min=1e-5
-    )
-    for epoch in range(epochs):
-        problem.nn_lyapunov.train()
-        optimizer.zero_grad()
-        loss_grid = lyapunov_loss_function(
-            grid_dev, problem.nn_lyapunov, problem.dynamics
-        )
-        loss_cex = lyapunov_loss_function(
-            cex_dev, problem.nn_lyapunov, problem.dynamics
-        )
-        loss = loss_grid + cex_weight * loss_cex
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        # Project output bias so V(0) = 0 exactly after every step.
-        # V(0)^2 has near-zero gradient when V(0) is already small, so gradient
-        # descent alone stalls. Subtracting V(0) from the output bias is exact.
-        with torch.no_grad():
-            origin_dev = torch.zeros(1, problem.state_dim, device=device)
-            v0 = problem.nn_lyapunov(origin_dev).squeeze()
-            net_seq = cast(nn.Sequential, problem.nn_lyapunov.network)
-            out_layer = cast(nn.Linear, net_seq[2])
-            out_layer.bias -= v0
-        if (epoch + 1) % 100 == 0:
-            print(
-                f"  retrain epoch [{epoch + 1}/{epochs}]  "
-                f"grid={loss_grid.item():.4f}  cex={loss_cex.item():.4f}"
-            )
-
-
 def _find_resume_point(
     checkpoint_dir: str, max_iterations: int, problem: LyapunovProblem
 ) -> tuple[int, list[list[tuple]]]:
@@ -262,7 +212,8 @@ def _find_resume_point(
     for i in range(max_iterations - 1, -1, -1):
         ckpt = load_checkpoint(checkpoint_dir, f"iter_{i}")
         if ckpt is not None:
-            problem.nn_lyapunov.load_state_dict(ckpt["model_state"])
+            _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
+            problem.update_shift()
             cex_history = ckpt.get("cex_history", [])
             print(f"Resuming from iteration {i + 1}")
             return i + 1, cex_history
@@ -348,7 +299,12 @@ def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem)
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Counterexamples found")
     ax.set_title("Counterexample count per iteration")
-    ax.set_xticks(range(n_iters))
+    if n_iters > 10:
+        from matplotlib.ticker import MaxNLocator
+
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=10))
+    else:
+        ax.set_xticks(range(n_iters))
 
     ax = axes[1]
     for i, cexs in enumerate(cex_history):
@@ -367,18 +323,29 @@ def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem)
     ax.set_ylabel("x2")
     ax.set_title("Counterexample locations by iteration")
     if any(cex_history):
-        ax.legend(fontsize=7, markerscale=1.5, loc="lower left")
+        ncol = max(1, n_iters // 10)
+        ax.legend(fontsize=6, markerscale=1.5, loc="lower left", ncol=ncol)
 
     ax = axes[2]
-    for i, cexs in enumerate(cex_history):
-        if cexs:
-            dists = [np.sqrt(p[0] ** 2 + p[1] ** 2) for p in cexs]
-            ax.hist(dists, bins=20, alpha=0.4, color=colors[i], label=f"iter {i}")
+    all_dists = []
+    for cexs in cex_history:
+        for p in cexs:
+            all_dists.append(np.sqrt(p[0] ** 2 + p[1] ** 2))
+    if all_dists:
+        # Compute shared bin edges so overlapping histograms are comparable
+        n_bins = min(20, max(1, len(set(np.round(all_dists, 6)))))
+        bin_edges = np.linspace(min(all_dists), max(all_dists), n_bins + 1)
+        for i, cexs in enumerate(cex_history):
+            if cexs:
+                dists = [np.sqrt(p[0] ** 2 + p[1] ** 2) for p in cexs]
+                ax.hist(
+                    dists, bins=bin_edges, alpha=0.4, color=colors[i], label=f"iter {i}"
+                )
     ax.set_xlabel("Distance from origin")
     ax.set_ylabel("Count")
     ax.set_title("Distance distribution of counterexamples")
     if any(cex_history):
-        ax.legend(fontsize=7)
+        ax.legend(fontsize=6)
 
     plt.tight_layout()
     fig.savefig(os.path.join(checkpoint_dir, "cex_history.png"), dpi=150)
@@ -407,11 +374,12 @@ def cmd_verify(args):
             print(f"Error: checkpoint not found: {path}", file=sys.stderr)
             sys.exit(1)
         ckpt = torch.load(path, weights_only=False)
-        problem.nn_lyapunov.load_state_dict(ckpt["model_state"])
+        _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
         print(f"Checkpoint loaded: {path}")
 
     device = torch.device(args.device)
     problem.to(device)
+    problem.update_shift()
 
     n_params = sum(p.numel() for p in problem.nn_lyapunov.parameters())
     hidden_size = getattr(problem.nn_lyapunov, "hidden_size", "?")
@@ -479,51 +447,65 @@ def cmd_train(args):
     print(f"Checkpoint dir: {checkpoint_dir}")
     print(
         f"Config:         epochs={args.epochs}  lr={args.lr}  grid={args.grid_pts}"
-        f"  retrain_lr={args.retrain_lr}  cex_weight={args.cex_weight}"
-        f"  cex_window={args.cex_window}  max_iter={args.max_iterations}"
+        f"  retrain_lr={args.retrain_lr}  cex_oversample={args.cex_oversample}"
+        f"  max_iter={args.max_iterations}"
         f"  early_exit={args.early_exit}  max_workers={args.max_workers}  hole={problem.hole}"
     )
     print()
 
-    # ── Initial training (or resume) ──────────────────────────────────────────
-    ckpt = load_checkpoint(checkpoint_dir, "initial_train")
-    if ckpt is not None:
-        problem.nn_lyapunov.load_state_dict(ckpt["model_state"])
-        print("Skipping initial training — loaded from checkpoint.")
-    else:
-        problem.to(device)
-        train_lyapunov_2d(
-            problem,
-            grid_pts=args.grid_pts,
-            num_epochs=args.epochs,
-            learning_rate=args.lr,
-        )
-        save_checkpoint(checkpoint_dir, "initial_train", problem)
-
-    # ── Initial verification ──────────────────────────────────────────────────
-    problem.to("cpu")
-    origin_cexs, spatial_cexs, polygons, raw_initial = _run_verify(
-        problem, "Initial verification"
-    )
-    _write_cex_csv(
-        os.path.join(checkpoint_dir, "initial_counterexamples.csv"),
-        raw_initial,
-        problem.state_dim,
-    )
-    plot_verification(
-        checkpoint_dir,
-        "initial_verification.png",
-        problem,
-        origin_cexs + spatial_cexs,
-        polygons,
-        args.grid_pts,
-        "Hyperplane verification: polygon tessellation + counterexamples",
-    )
-
-    base_grid = _build_base_grid(problem, args.grid_pts)
+    # ── Check for mid-loop resume point first ────────────────────────────────
+    # Peek at iter checkpoints before deciding whether to train, so we don't
+    # re-train from scratch when only initial_train.pt is missing.
+    base_grid = build_base_grid(problem, args.grid_pts)
     start_iteration, cex_history = _find_resume_point(
         checkpoint_dir, args.max_iterations, problem
     )
+
+    if start_iteration > 0:
+        # Model already loaded from iter checkpoint — skip training and initial verify
+        problem.to(device)
+        problem.update_shift()
+    else:
+        # ── Initial training (or resume from initial_train.pt) ────────────────
+        ckpt = load_checkpoint(checkpoint_dir, "initial_train")
+        if ckpt is not None:
+            _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
+            problem.to(device)
+            problem.update_shift()
+            print("Skipping initial training — loaded from checkpoint.")
+        else:
+            problem.to(device)
+            train_lyapunov_2d(
+                problem,
+                grid_pts=args.grid_pts,
+                num_epochs=args.epochs,
+                learning_rate=args.lr,
+            )
+            problem.update_shift()
+            save_checkpoint(checkpoint_dir, "initial_train", problem)
+
+        # ── Initial verification ──────────────────────────────────────────────
+        problem.to("cpu")
+        origin_cexs, spatial_cexs, polygons, raw_initial = _run_verify(
+            problem, "Initial verification"
+        )
+        _write_cex_csv(
+            os.path.join(checkpoint_dir, "initial_counterexamples.csv"),
+            raw_initial,
+            problem.state_dim,
+        )
+        plot_verification(
+            checkpoint_dir,
+            "initial_verification.png",
+            problem,
+            origin_cexs + spatial_cexs,
+            polygons,
+            args.grid_pts,
+            "Hyperplane verification: polygon tessellation + counterexamples",
+        )
+
+        if not origin_cexs and not spatial_cexs:
+            return
 
     # ── Verification / retrain loop ───────────────────────────────────────────
     for i in range(start_iteration, args.max_iterations):
@@ -544,20 +526,17 @@ def cmd_train(args):
 
         append_verify_log(verify_log, i, raw)
 
-        window = [p for h in cex_history[-args.cex_window :] for p in h]
-        print(
-            f"  {len(window)} counterexamples in training window "
-            f"(last {args.cex_window} iters)."
-        )
+        all_cexs = [p for h in cex_history for p in h]
+        print(f"  {len(all_cexs)} total accumulated counterexamples.")
 
-        _retrain(
+        retrain(
             problem,
             base_grid,
-            window,
+            all_cexs,
             args.epochs,
             args.retrain_lr,
-            args.cex_weight,
             device,
+            cex_oversample=args.cex_oversample,
         )
         print(f"Iteration {i} completed in {time.time() - start:.2f}s\n")
         save_checkpoint(
@@ -673,12 +652,11 @@ def main():
         "--lr", type=float, default=1e-3, help="Initial training LR"
     )
     train_parser.add_argument("--retrain-lr", type=float, default=4e-4)
-    train_parser.add_argument("--cex-weight", type=float, default=10.0)
     train_parser.add_argument(
-        "--cex-window",
+        "--cex-oversample",
         type=int,
         default=3,
-        help="Retrain on current + this many prior iterations",
+        help="How many copies of each counterexample point to include in the training grid",
     )
 
     args = parser.parse_args()
