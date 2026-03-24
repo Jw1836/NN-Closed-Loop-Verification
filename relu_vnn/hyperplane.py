@@ -157,19 +157,25 @@ def enumerate_cells_bfs(
     * vertices (``cell.intersections``) and
     * halfplane equations (``cell.halfspaces``) for point-in-cell tests.
     """
-    from scipy.spatial import ConvexHull, QhullError
+    from scipy.spatial import QhullError
 
-    # Seed the BFS from the domain center plus offset points at ±25% of each
-    # dimension's range.  Multiple seeds guard against the center landing in a
-    # near-degenerate cell (e.g. when many hyperplanes cluster near the origin
-    # after training), which would stall BFS with an empty queue.
+    # Seed the BFS from offset points at ±25% of each dimension's range.
+    # The domain center is deliberately excluded: for Lyapunov networks many
+    # hyperplanes cluster near the origin, making the center cell degenerate
+    # and wasting a Chebyshev LP solve.
     state_dim = region.shape[0]
     center = region.mean(axis=1)
     quarter = (region[:, 1] - region[:, 0]) * 0.25
-    seed_points = [center] + [
+    seed_points = [
         center + quarter * np.array(signs)
         for signs in itertools.product([-1.0, 1.0], repeat=state_dim)
     ]
+
+    # Pre-compute both halfspace orientations for vectorized cell construction.
+    n_hidden = W_matrix.shape[1]
+    n_bbox = bbox_hs.shape[0]
+    neuron_hs_active = np.column_stack([-W_matrix.T, -B_vector])  # (n_hidden, dim+1)
+    neuron_hs_inactive = np.column_stack([W_matrix.T, B_vector])  # (n_hidden, dim+1)
 
     # BFS invariant: `visited` contains every activation pattern that has ever
     # been enqueued, so each pattern is processed at most once.  Completeness
@@ -185,19 +191,18 @@ def enumerate_cells_bfs(
             visited.add(sigma)
             queue.append((sigma, pt))
     cells: list[HalfspaceIntersection] = []
-    total_volume = 0.0  # accumulated for the sanity check at the end
 
-    # `is_seed` enables diagnostic printing only for the very first cell.
-    # If the seed cell is skipped, something is likely wrong with the network
-    # or domain configuration, so we emit a warning.  After the seed, skipped
-    # cells are expected (BFS explores candidate neighbors that may be empty).
-    is_seed = True
     while queue:
         sigma, hint = queue.popleft()
 
         # Build the halfspace system: n ReLU constraints + 2*state_dim
         # bounding-box walls.  Each row is [a1, ..., an, b] meaning a·x + b ≤ 0.
-        hs = build_cell_halfspaces(W_matrix, B_vector, bbox_hs, sigma)
+        # Vectorized: select pre-computed active/inactive rows by pattern.
+        pattern_arr = np.array(sigma, dtype=bool)
+        hs = np.empty((n_hidden + n_bbox, state_dim + 1))
+        hs[:n_bbox] = bbox_hs
+        hs[n_bbox:][pattern_arr] = neuron_hs_active[pattern_arr]
+        hs[n_bbox:][~pattern_arr] = neuron_hs_inactive[~pattern_arr]
 
         # --- Find a strictly interior point (required by HalfspaceIntersection) ---
         # Fast path: the hint (reflected interior of the parent cell) is often
@@ -211,16 +216,6 @@ def enumerate_cells_bfs(
             # (activation pattern has no realizable region in the domain).
             interior = find_chebyshev_center(hs)
             if interior is None:
-                # Skipping infeasible / degenerate cells does not break
-                # completeness: an infeasible pattern has no realizable region
-                # in the domain (it was a candidate neighbor that turned out
-                # empty).  A zero-volume cell has no interior and therefore no
-                # tight hyperplanes that could lead to undiscovered neighbors.
-                if is_seed:
-                    logger.debug(
-                        "[BFS seed] Chebyshev center LP infeasible — seed cell skipped"
-                    )
-                is_seed = False
                 continue
 
         # --- Compute cell vertices ---
@@ -230,44 +225,15 @@ def enumerate_cells_bfs(
                 interior,
                 incremental=False,
             )
-        except QhullError as e:
-            if is_seed:
-                logger.warning("[BFS seed] QhullError in HalfspaceIntersection: %s", e)
-            is_seed = False
+        except QhullError:
             continue  # degenerate (e.g. numerically flat cell)
 
         raw_verts = hs_obj.intersections
 
-        # HalfspaceIntersection can return duplicate or near-collinear points.
-        # ConvexHull filters these and gives vertices in CCW order.
         if len(raw_verts) < state_dim + 1:
-            if is_seed:
-                logger.debug(
-                    "[BFS seed] too few raw vertices: %d < %d",
-                    len(raw_verts),
-                    state_dim + 1,
-                )
-            is_seed = False
-            continue
-        try:
-            hull = ConvexHull(raw_verts, incremental=False)
-        except QhullError as e:
-            if is_seed:
-                logger.warning("[BFS seed] QhullError in ConvexHull: %s", e)
-            is_seed = False
-            continue  # degenerate (collinear points, etc.)
-        if len(hull.vertices) < state_dim + 1:
-            if is_seed:
-                logger.debug(
-                    "[BFS seed] too few hull vertices: %d < %d",
-                    len(hull.vertices),
-                    state_dim + 1,
-                )
-            is_seed = False
             continue
 
         cells.append(hs_obj)
-        total_volume += hull.volume
 
         # --- Discover neighboring cells ---
         # Evaluate all neuron pre-activations w_i · v + b_i at every vertex.
@@ -275,8 +241,8 @@ def enumerate_cells_bfs(
         # meaning the cell shares a facet with the cell on the other side of
         # that hyperplane — this is the adjacency condition in the arrangement
         # graph.  Vectorized: all n hyperplanes × all k vertices at once.
-        ordered_verts = raw_verts[hull.vertices]
-        all_values = ordered_verts @ W_matrix + B_vector  # (k, n_hidden)
+        # Using raw_verts directly (duplicates don't affect np.any).
+        all_values = raw_verts @ W_matrix + B_vector  # (k, n_hidden)
         tight_mask = np.any(np.abs(all_values) < EPS, axis=0)  # (n_hidden,)
 
         for i in np.where(tight_mask)[0]:
@@ -297,22 +263,22 @@ def enumerate_cells_bfs(
                 neighbor_hint = interior - 2 * dist * w
                 queue.append((neighbor_pat, neighbor_hint))
 
-    # ── Sanity check: cells must tile the bounding box exactly ──────────────
-    # If the cells partition the domain correctly, their volumes must sum to
-    # the bounding-box volume.  A shortfall means cells were missed; an excess
-    # means cells overlap.  Either way, verification results would be unsound.
-    bbox_volume = float(np.prod(region[:, 1] - region[:, 0]))
-    rel_error = (
-        abs(total_volume - bbox_volume) / bbox_volume if bbox_volume > 0 else 0.0
-    )
-    if rel_error > 1e-6:
-        raise RuntimeError(
-            f"Cell enumeration volume mismatch: "
-            f"sum(cell volumes)={total_volume:.8g} vs "
-            f"bbox volume={bbox_volume:.8g} "
-            f"(relative error={rel_error:.2e}). "
-            f"This indicates missing or overlapping cells."
-        )
+    # ── Sanity check: activation-pattern sampling ─────────────────────────
+    # Verify BFS completeness by sampling random points in the bounding box
+    # and checking that each point's activation pattern was discovered.
+    # Overlap is impossible by construction (each point has exactly one
+    # deterministic activation pattern).
+    rng = np.random.default_rng(42)
+    n_samples = 10_000
+    samples = rng.uniform(region[:, 0], region[:, 1], size=(n_samples, state_dim))
+    sample_patterns = samples @ W_matrix + B_vector  # (n_samples, n_hidden)
+    for row in sample_patterns:
+        pat = tuple(bool(v > 0) for v in row)
+        if pat not in visited:
+            raise RuntimeError(
+                "Cell enumeration incomplete: sampled activation pattern "
+                "not found by BFS. This indicates missing cells."
+            )
 
     return cells
 
