@@ -69,7 +69,7 @@ class DuffingProblem(LyapunovProblem):
     def __init__(
         self,
         region: Tensor,
-        hidden_size: int = 5,
+        hidden_size: int,
         delta: float = DELTA,
         alpha: float = ALPHA,
         beta: float = BETA,
@@ -81,7 +81,7 @@ class DuffingProblem(LyapunovProblem):
         )
 
 
-def make_problem(hidden_size: int = 150, **kwargs) -> LyapunovProblem:
+def make_problem(hidden_size: int = 100, **kwargs) -> LyapunovProblem:
     """Factory function for the CEGIS runner."""
     return DuffingProblem(
         region=torch.tensor([[-2.0, 2.0], [-2.0, 2.0]]),

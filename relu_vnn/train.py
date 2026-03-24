@@ -2,7 +2,6 @@
 
 import logging
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -55,152 +54,88 @@ def lyapunov_loss_function(
     return origin_penalty + positive_penalty + lie_penalty + flatness_penalty
 
 
-def train_model_lyapunov_general(
-    model,
-    x_train_2d,
-    num_epochs,
-    learning_rate,
-    dynamics: nn.Module,
-    alpha: float = 1.0,
-):
-    """Train a neural Lyapunov function using the composite Lyapunov loss."""
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    for epoch in range(num_epochs):
-        model.train()
-        optimizer.zero_grad()
-        loss = lyapunov_loss_function(x_train_2d, model, dynamics, alpha)
-        loss.backward()
-        optimizer.step()
-        if (epoch + 1) % 100 == 0:
-            logger.info("Epoch [%d/%d], Loss: %.4f", epoch + 1, num_epochs, loss.item())
-    return model
+def build_base_grid(problem: LyapunovProblem, n_samples: int) -> torch.Tensor:
+    """Sample uniformly at random over the problem's region.
 
-
-def fine_tune_on_counterexamples(
-    problem: LyapunovProblem,
-    counterexamples: list,
-    num_epochs: int = 200,
-    learning_rate: float = 1e-4,
-) -> None:
-    """Refine the Lyapunov network on verifier counterexamples.
-
-    Only the Lie-derivative penalty is applied (plus the origin condition so
-    V(0) = 0 is not disturbed).  Using a small learning rate keeps all other
-    regions of V approximately intact — equivalent to "freezing" the good parts
-    without literally locking any weights.
-
-    Args:
-        problem:          LyapunovProblem whose nn_lyapunov will be updated in place.
-        counterexamples:  List of state-space points where V_dot >= 0.
-        num_epochs:       Gradient steps on the counterexample batch.
-        learning_rate:    Small LR to avoid forgetting already-correct regions.
+    Random sampling avoids the exponential blow-up of a full meshgrid in high
+    dimensions (D > 2). The argument is interpreted as a total sample count, not
+    pts-per-dimension, so memory usage is predictable regardless of state_dim.
     """
-    model = problem.nn_lyapunov
-
-    cex_t = torch.tensor(counterexamples, dtype=torch.float32, device=problem.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-
-    for epoch in range(num_epochs):
-        model.train()
-        optimizer.zero_grad()
-
-        x = cex_t.clone().requires_grad_(True)
-        V_x = model(x)
-
-        # Origin condition — don't let it drift
-        origin = torch.zeros((1, problem.state_dim), device=problem.device)
-        origin_penalty = model(origin).pow(2).mean()
-
-        # Lie derivative at counterexample points only
-        grad_V = torch.autograd.grad(
-            outputs=V_x,
-            inputs=x,
-            grad_outputs=torch.ones_like(V_x),
-            create_graph=True,
-        )[0]
-        with torch.no_grad():
-            f_vec = problem.dynamics(cex_t)
-        lie_derivative = torch.sum(grad_V * f_vec, dim=1)
-        lie_penalty = torch.relu(lie_derivative + 1e-6).mean()
-
-        loss = origin_penalty + lie_penalty
-        loss.backward()
-        optimizer.step()
-
-        if (epoch + 1) % 50 == 0:
-            logger.info(
-                "  fine-tune epoch [%d/%d], lie_penalty=%.4f",
-                epoch + 1,
-                num_epochs,
-                lie_penalty.item(),
-            )
+    lo = problem.region[:, 0]  # (D,)
+    hi = problem.region[:, 1]  # (D,)
+    samples = torch.rand(n_samples, problem.state_dim)  # uniform [0, 1)
+    return lo + samples * (hi - lo)  # rescale to region
 
 
-def train_lyapunov_2d(
+def default_initial_grid_pts(_problem: LyapunovProblem) -> int:
+    """Heuristic for AdamW initial training: target ~500k total samples."""
+    return 500_000
+
+
+def default_finetune_grid_pts(_problem: LyapunovProblem) -> int:
+    """Heuristic for L-BFGS fine-tuning: target ~10k total samples."""
+    return 10_000
+
+
+def train_initial(
     problem: LyapunovProblem,
-    grid_pts: int = 50,
-    num_epochs: int = 100,
-    learning_rate: float = 1e-3,
+    grid_pts: int | None = None,
+    epochs: int = 400,
+    lr: float = 1e-3,
     alpha: float = 1.0,
 ):
-    # Names easier to work with
-    x1_min, x1_max = problem.region[0, 0].item(), problem.region[0, 1].item()
-    x2_min, x2_max = problem.region[1, 0].item(), problem.region[1, 1].item()
+    """Train the Lyapunov network from scratch on a uniform grid using AdamW.
+
+    AdamW's stochastic exploration finds the globally structured (radial) minimum
+    that L-BFGS misses when starting from random init. Weight decay additionally
+    discourages flat-bowl local minima near the origin.
+    """
+    if grid_pts is None:
+        grid_pts = default_initial_grid_pts(problem)
+        logger.info("Initial training grid: %d samples (heuristic)", grid_pts)
     model = problem.nn_lyapunov
+    train_data = build_base_grid(problem, grid_pts).to(problem.device)
 
-    # First, create a training set from linearly spaced samples in grid
-    x1_t = torch.linspace(x1_min, x1_max, grid_pts)
-    x2_t = torch.linspace(x2_min, x2_max, grid_pts)
-    x1g, x2g = torch.meshgrid(x1_t, x2_t, indexing="ij")
-    x_train = torch.stack([x1g.flatten(), x2g.flatten()], dim=1).to(problem.device)
-
-    # Create an optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    for epoch in range(num_epochs):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    for epoch in range(epochs):
         model.train()
         optimizer.zero_grad()
-        loss = lyapunov_loss_function(x_train, model, problem.dynamics, alpha)
+        loss = lyapunov_loss_function(train_data, model, problem.dynamics, alpha)
         loss.backward()
         optimizer.step()
         if (epoch + 1) % 100 == 0:
-            logger.info("Epoch [%d/%d], Loss: %.4f", epoch + 1, num_epochs, loss.item())
+            logger.info("Epoch [%d/%d], Loss: %.7f", epoch + 1, epochs, loss.item())
 
 
-def build_base_grid(problem: LyapunovProblem, grid_pts: int) -> torch.Tensor:
-    """Build a uniform grid over the problem's region."""
-    region_np = problem.region.numpy()
-    linspaces = [
-        np.linspace(region_np[d, 0], region_np[d, 1], grid_pts)
-        for d in range(problem.state_dim)
-    ]
-    mesh = np.meshgrid(*linspaces, indexing="ij")
-    return torch.tensor(
-        np.stack([m.ravel() for m in mesh], axis=1), dtype=torch.float32
-    )
-
-
-def retrain(
+def finetune(
     problem: LyapunovProblem,
-    base_grid: torch.Tensor,
     cexs: list[tuple],
     epochs: int,
-    lr: float,
     device: torch.device,
+    alpha: float = 1.0,
     cex_oversample: int = 3,
+    grid_pts: int | None = None,
+    lbfgs_max_iter: int = 20,
 ):
-    """Retrain the Lyapunov network on a grid merged with counterexamples.
+    """Fine-tune the Lyapunov network on a fresh small grid merged with counterexamples.
 
-    Counterexample points are oversampled (duplicated) in the training tensor
-    so they have more influence without a separate weighted loss.
+    A fresh grid is built each call (grid_pts per dimension) so the training
+    dataset stays small and focused — the gradient from violating cells is not
+    diluted by thousands of already-satisfied grid points accumulated over prior
+    iterations.
+
+    Uses L-BFGS with strong Wolfe line search — well-suited for polishing a
+    nearly-correct solution on a fixed dataset.
     """
+    if grid_pts is None:
+        grid_pts = default_finetune_grid_pts(problem)
     problem.to(device)
-    problem.update_shift()
 
     _BALL_RADIUS = 0.05  # fraction of region span per dimension
     _N_BALL = 9  # extra samples per counterexample
 
     # Merge counterexamples into the training grid
-    grid_dev = base_grid.to(device)
+    grid_dev = build_base_grid(problem, grid_pts).to(device)
     if cexs:
         cex_pts = torch.tensor([p[:-1] for p in cexs], dtype=torch.float32)  # (M, d)
         cex_repeated = cex_pts.repeat(cex_oversample, 1)
@@ -225,19 +160,25 @@ def retrain(
     else:
         train_data = grid_dev
 
-    optimizer = torch.optim.Adam(problem.nn_lyapunov.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs, eta_min=1e-5
+    model = problem.nn_lyapunov
+    optimizer = torch.optim.LBFGS(
+        model.parameters(),
+        max_iter=lbfgs_max_iter,
+        history_size=100,
+        line_search_fn="strong_wolfe",
     )
-    for epoch in range(epochs):
-        problem.nn_lyapunov.train()
+
+    def closure():
         optimizer.zero_grad()
-        loss = lyapunov_loss_function(train_data, problem.nn_lyapunov, problem.dynamics)
+        loss = lyapunov_loss_function(train_data, model, problem.dynamics, alpha)
         loss.backward()
-        optimizer.step()
-        scheduler.step()
-        if (epoch + 1) % 100 == 0:
-            print(f"  retrain epoch [{epoch + 1}/{epochs}]  loss={loss.item():.4f}")
+        return loss
+
+    for epoch in range(epochs):
+        model.train()
+        loss = optimizer.step(closure)
+        if (epoch + 1) % 10 == 0:
+            print(f"  retrain epoch [{epoch + 1}/{epochs}]  loss={loss.item():.7f}")
 
     # Re-zero V(0) after training drift
     problem.update_shift()
