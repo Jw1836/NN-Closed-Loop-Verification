@@ -3,13 +3,13 @@
 from .lyapunov import LyapunovProblem
 from .train import (
     lyapunov_loss_function,
-    train_lyapunov_2d,
-    fine_tune_on_counterexamples,
+    train_initial,
+    finetune,
 )
 
 __all__ = [
     "LyapunovProblem",
     "lyapunov_loss_function",
-    "train_lyapunov_2d",
-    "fine_tune_on_counterexamples",
+    "train_initial",
+    "finetune",
 ]

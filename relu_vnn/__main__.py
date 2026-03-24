@@ -32,7 +32,12 @@ import torch
 from typing import cast
 
 from .lyapunov import LyapunovProblem
-from .train import train_lyapunov_2d, build_base_grid, retrain
+from .train import (
+    train_initial,
+    finetune,
+    default_initial_grid_pts,
+    default_finetune_grid_pts,
+)
 
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
@@ -367,6 +372,9 @@ def cmd_verify(args):
     problem.max_workers = args.max_workers
     if args.hole is not None:
         problem.hole = args.hole
+    else:
+        spans = problem.region[:, 1] - problem.region[:, 0]
+        problem.hole = float(spans.min().item()) * 0.001
 
     if args.checkpoint is not None:
         path = args.checkpoint
@@ -402,13 +410,14 @@ def cmd_verify(args):
         raw,
         problem.state_dim,
     )
+    plot_grid_pts = args.grid_pts if args.grid_pts is not None else 200
     plot_verification(
         output_dir,
         f"{slug}_verification.png",
         problem,
         origin_cexs + spatial_cexs,
         polygons,
-        args.grid_pts,
+        plot_grid_pts,
         f"{type(problem).__name__}: polygon tessellation + counterexamples",
     )
 
@@ -425,6 +434,9 @@ def cmd_train(args):
     problem.max_workers = args.max_workers
     if args.hole is not None:
         problem.hole = args.hole
+    else:
+        spans = problem.region[:, 1] - problem.region[:, 0]
+        problem.hole = float(spans.min().item()) * 0.001
 
     # ── Checkpoint dir ────────────────────────────────────────────────────────
     if args.checkpoint_dir is None:
@@ -440,15 +452,25 @@ def cmd_train(args):
     # ── Print config ──────────────────────────────────────────────────────────
     n_params = sum(p.numel() for p in problem.nn_lyapunov.parameters())
     hidden_size = getattr(problem.nn_lyapunov, "hidden_size", "?")
+    _initial_grid = (
+        args.grid_pts
+        if args.grid_pts is not None
+        else default_initial_grid_pts(problem)
+    )
+    _finetune_grid = (
+        args.finetune_grid_pts
+        if args.finetune_grid_pts is not None
+        else default_finetune_grid_pts(problem)
+    )
+    plot_grid_pts = args.grid_pts if args.grid_pts is not None else 200
     print(f"Problem:        {problem}")
     print(f"Lyapunov net:   hidden_size={hidden_size}  params={n_params:,}")
     print(f"Dynamics:       {problem.dynamics}")
     print(f"Device:         {device}")
     print(f"Checkpoint dir: {checkpoint_dir}")
     print(
-        f"Config:         epochs={args.epochs}  lr={args.lr}  grid={args.grid_pts}"
-        f"  retrain_lr={args.retrain_lr}  cex_oversample={args.cex_oversample}"
-        f"  max_iter={args.max_iterations}"
+        f"Config:         epochs={args.epochs}  finetune_epochs={args.finetune_epochs}  lbfgs_max_iter={args.lbfgs_max_iter}  lr={args.lr}  alpha={args.alpha}  grid={_initial_grid}  finetune_grid={_finetune_grid}"
+        f"  cex_oversample={args.cex_oversample}  max_iter={args.max_iterations}"
         f"  early_exit={args.early_exit}  max_workers={args.max_workers}  hole={problem.hole}"
     )
     print()
@@ -456,7 +478,6 @@ def cmd_train(args):
     # ── Check for mid-loop resume point first ────────────────────────────────
     # Peek at iter checkpoints before deciding whether to train, so we don't
     # re-train from scratch when only initial_train.pt is missing.
-    base_grid = build_base_grid(problem, args.grid_pts)
     start_iteration, cex_history = _find_resume_point(
         checkpoint_dir, args.max_iterations, problem
     )
@@ -475,11 +496,12 @@ def cmd_train(args):
             print("Skipping initial training — loaded from checkpoint.")
         else:
             problem.to(device)
-            train_lyapunov_2d(
+            train_initial(
                 problem,
-                grid_pts=args.grid_pts,
-                num_epochs=args.epochs,
-                learning_rate=args.lr,
+                grid_pts=args.grid_pts,  # None → heuristic inside train_initial
+                epochs=args.epochs,
+                lr=args.lr,
+                alpha=args.alpha,
             )
             problem.update_shift()
             save_checkpoint(checkpoint_dir, "initial_train", problem)
@@ -500,7 +522,7 @@ def cmd_train(args):
             problem,
             origin_cexs + spatial_cexs,
             polygons,
-            args.grid_pts,
+            plot_grid_pts,
             "Hyperplane verification: polygon tessellation + counterexamples",
         )
 
@@ -526,17 +548,15 @@ def cmd_train(args):
 
         append_verify_log(verify_log, i, raw)
 
-        all_cexs = [p for h in cex_history for p in h]
-        print(f"  {len(all_cexs)} total accumulated counterexamples.")
-
-        retrain(
+        finetune(
             problem,
-            base_grid,
-            all_cexs,
-            args.epochs,
-            args.retrain_lr,
+            cexs,
+            args.finetune_epochs,
             device,
+            alpha=args.alpha,
             cex_oversample=args.cex_oversample,
+            grid_pts=args.finetune_grid_pts,
+            lbfgs_max_iter=args.lbfgs_max_iter,
         )
         print(f"Iteration {i} completed in {time.time() - start:.2f}s\n")
         save_checkpoint(
@@ -563,9 +583,11 @@ def cmd_train(args):
         problem,
         origin_cexs + spatial_cexs,
         final_polygons,
-        args.grid_pts,
+        plot_grid_pts,
         "Final verification: polygon tessellation + counterexamples",
     )
+    if not origin_cexs and not spatial_cexs:
+        save_checkpoint(checkpoint_dir, "passed", problem)
     plot_cex_history(checkpoint_dir, cex_history, problem)
 
 
@@ -595,7 +617,7 @@ def _add_common_args(parser: argparse.ArgumentParser):
         "--hole",
         type=float,
         default=None,
-        help="Exclusion radius around origin: positivity and decrease counterexamples within this ball are not required (default: 1e-6)",
+        help="Exclusion radius around origin: positivity and decrease counterexamples within this ball are not required (default: 0.1%% of smallest region span)",
     )
     parser.add_argument(
         "--hidden-size",
@@ -603,7 +625,12 @@ def _add_common_args(parser: argparse.ArgumentParser):
         default=None,
         help="Override hidden layer size in the Lyapunov net",
     )
-    parser.add_argument("--grid-pts", type=int, default=300)
+    parser.add_argument(
+        "--grid-pts",
+        type=int,
+        default=None,
+        help="Grid points per dimension for plotting and (train) initial AdamW training (default: D * max_span * 40)",
+    )
     parser.add_argument(
         "-v",
         "--verbose",
@@ -647,11 +674,39 @@ def main():
         help="Directory for checkpoints (default: checkpoints_<problem_name>)",
     )
     train_parser.add_argument("--max-iterations", type=int, default=5)
-    train_parser.add_argument("--epochs", type=int, default=800)
     train_parser.add_argument(
-        "--lr", type=float, default=1e-3, help="Initial training LR"
+        "--epochs", type=int, default=400, help="Epochs for initial AdamW training"
     )
-    train_parser.add_argument("--retrain-lr", type=float, default=4e-4)
+    train_parser.add_argument(
+        "--finetune-epochs",
+        type=int,
+        default=5,
+        help="L-BFGS restart count after each verification (default: 5; L-BFGS converges in 1, rest are safety)",
+    )
+    train_parser.add_argument(
+        "--finetune-grid-pts",
+        type=int,
+        default=None,
+        help="Grid points per dimension for the fresh grid in each finetune step (default: D * max_span * 4)",
+    )
+    train_parser.add_argument(
+        "--lbfgs-max-iter",
+        type=int,
+        default=20,
+        help="Max closure evaluations per L-BFGS step (default: 20; increase for harder problems)",
+    )
+    train_parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,
+        help="AdamW learning rate for initial training",
+    )
+    train_parser.add_argument(
+        "--alpha",
+        type=float,
+        default=1.0,
+        help="Flatness penalty scale: penalises V(x) < alpha*||x|| (default: 1.0)",
+    )
     train_parser.add_argument(
         "--cex-oversample",
         type=int,
