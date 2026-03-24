@@ -2,7 +2,6 @@
 
 import logging
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -55,29 +54,27 @@ def lyapunov_loss_function(
     return origin_penalty + positive_penalty + lie_penalty + flatness_penalty
 
 
-def build_base_grid(problem: LyapunovProblem, grid_pts: int) -> torch.Tensor:
-    """Build a uniform grid over the problem's region."""
-    region_np = problem.region.numpy()
-    linspaces = [
-        np.linspace(region_np[d, 0], region_np[d, 1], grid_pts)
-        for d in range(problem.state_dim)
-    ]
-    mesh = np.meshgrid(*linspaces, indexing="ij")
-    return torch.tensor(
-        np.stack([m.ravel() for m in mesh], axis=1), dtype=torch.float32
-    )
+def build_base_grid(problem: LyapunovProblem, n_samples: int) -> torch.Tensor:
+    """Sample uniformly at random over the problem's region.
+
+    Random sampling avoids the exponential blow-up of a full meshgrid in high
+    dimensions (D > 2). The argument is interpreted as a total sample count, not
+    pts-per-dimension, so memory usage is predictable regardless of state_dim.
+    """
+    lo = problem.region[:, 0]  # (D,)
+    hi = problem.region[:, 1]  # (D,)
+    samples = torch.rand(n_samples, problem.state_dim)  # uniform [0, 1)
+    return lo + samples * (hi - lo)  # rescale to region
 
 
-def default_initial_grid_pts(problem: LyapunovProblem) -> int:
-    """Heuristic for AdamW initial training: D * max_region_span * 40."""
-    spans = problem.region[:, 1] - problem.region[:, 0]
-    return max(50, int(problem.state_dim * float(spans.max().item()) * 40))
+def default_initial_grid_pts(_problem: LyapunovProblem) -> int:
+    """Heuristic for AdamW initial training: target ~500k total samples."""
+    return 500_000
 
 
-def default_finetune_grid_pts(problem: LyapunovProblem) -> int:
-    """Heuristic for L-BFGS fine-tuning: D * max_region_span * 4."""
-    spans = problem.region[:, 1] - problem.region[:, 0]
-    return max(10, int(problem.state_dim * float(spans.max().item()) * 4))
+def default_finetune_grid_pts(_problem: LyapunovProblem) -> int:
+    """Heuristic for L-BFGS fine-tuning: target ~10k total samples."""
+    return 10_000
 
 
 def train_initial(
@@ -95,7 +92,7 @@ def train_initial(
     """
     if grid_pts is None:
         grid_pts = default_initial_grid_pts(problem)
-        logger.info("Initial training grid: %d pts/dim (heuristic)", grid_pts)
+        logger.info("Initial training grid: %d samples (heuristic)", grid_pts)
     model = problem.nn_lyapunov
     train_data = build_base_grid(problem, grid_pts).to(problem.device)
 
