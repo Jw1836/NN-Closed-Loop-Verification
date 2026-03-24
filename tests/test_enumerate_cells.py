@@ -369,8 +369,13 @@ class TestNonOverlapping:
             (W_MATRIX, B_VECTOR, REGION),
             (W_3D, B_3D, REGION_3D),
             (np.eye(5), np.zeros(5), _make_region(5)),
+            (
+                np.array([[1.0, 1.0], [1.0, -1.0]]),
+                np.zeros(2),
+                REGION,
+            ),
         ],
-        ids=["2d-quadrants", "3d-octants", "5d-orthants"],
+        ids=["2d-quadrants", "3d-octants", "5d-orthants", "2d-oblique"],
     )
     def setup(self, request):
         W, B, region = request.param
@@ -390,3 +395,26 @@ class TestNonOverlapping:
             pt = rng.uniform(lo, hi)
             count = _count_containing_cells(cells, pt)
             assert count == 1, f"Point {pt} in {count} cells (expected 1)"
+
+
+# ---------------------------------------------------------------------------
+# H. Oblique arrangement (non-axis-aligned hyperplanes)
+# ---------------------------------------------------------------------------
+
+
+class TestObliqueArrangement:
+    """Two diagonal hyperplanes x+y=0 and x-y=0 create 4 diamond-shaped cells."""
+
+    @pytest.fixture
+    def cells(self):
+        W = np.array([[1.0, 1.0], [1.0, -1.0]])
+        B = np.zeros(2)
+        bbox_hs = build_bbox_halfspaces(REGION)
+        return enumerate_cells_bfs(W, B, bbox_hs, REGION)
+
+    def test_four_cells(self, cells):
+        assert len(cells) == 4
+
+    def test_tiles_domain(self, cells):
+        total = sum(ConvexHull(c.intersections).volume for c in cells)
+        assert total == pytest.approx(4.0, abs=1e-8)
