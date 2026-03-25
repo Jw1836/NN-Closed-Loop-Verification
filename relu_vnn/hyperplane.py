@@ -243,26 +243,35 @@ def enumerate_cells_bfs(
 
     if n_workers > 1:
         import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
         ctx = mp.get_context("forkserver")
-        with ctx.Pool(n_workers) as pool:
-            while queue:
-                # Phase A: drain entire queue, build halfspace matrices
-                batch: list[tuple[ActivationPattern, np.ndarray]] = []
+        # Stream results as they arrive instead of draining the full queue per
+        # wave.  As each geometry result returns we immediately discover its
+        # neighbors and submit them to the executor, so workers stay busy
+        # across BFS wave boundaries rather than idling between phases.
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+            pending: dict = {}  # future -> sigma
+
+            def _submit_queue() -> None:
                 while queue:
                     sigma = queue.popleft()
-                    batch.append((sigma, _build_hs(sigma)))
+                    f = executor.submit(
+                        _bfs_geometry_worker, (_build_hs(sigma), state_dim)
+                    )
+                    pending[f] = sigma
 
-                # Phase B: parallel LP + Qhull
-                worker_args = [(hs, state_dim) for (_, hs) in batch]
-                results = pool.map(_bfs_geometry_worker, worker_args)
+            _submit_queue()  # seed from initial BFS queue
 
-                # Phase C: collect results, discover neighbors
-                for (sigma, _), (hs_obj, feasible) in zip(batch, results):
-                    if not feasible or hs_obj is None:
-                        continue
-                    cells.append(hs_obj)
-                    _discover_neighbors(sigma, hs_obj.intersections)
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    sigma = pending.pop(future)
+                    hs_obj, feasible = future.result()
+                    if feasible and hs_obj is not None:
+                        cells.append(hs_obj)
+                        _discover_neighbors(sigma, hs_obj.intersections)
+                _submit_queue()  # submit any neighbors just discovered
     else:
         # Single-threaded path: LP + Qhull inline (original behaviour).
         from scipy.spatial import QhullError
