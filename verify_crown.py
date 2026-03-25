@@ -173,15 +173,14 @@ def verify_lyapunov_nn(
     return verification_result
 
 
-if __name__ == "__main__":
+def _test_negative_dynamics():
+    """In-file test: V(x) = |x1| + |x2| is a valid Lyapunov for f(x) = -x.
+
+    dV/dt = sign(x)·(-x) = -|x1| - |x2| < 0.
+    Represented exactly as relu(x1)+relu(-x1)+relu(x2)+relu(-x2).
+    """
 
     class ReLULyapunov(nn.Module):
-        """V(x) = |x1| + |x2| — valid Lyapunov for f(x) = -x.
-
-        dV/dt = sign(x)·(-x) = -|x1| - |x2| < 0.
-        Represented exactly as relu(x1)+relu(-x1)+relu(x2)+relu(-x2).
-        """
-
         def __init__(self):
             super().__init__()
             l1 = nn.Linear(2, 4, bias=False)
@@ -202,15 +201,45 @@ if __name__ == "__main__":
         def forward(self, x):
             return -x
 
-    # Define a simple Lyapunov problem
     nn_lyapunov = ReLULyapunov()
     print(nn_lyapunov)
     dynamics = NegativeDynamics()
-    region = torch.tensor([[-1.0, 1.0], [-1.0, 1.0]])  # 2D region
+    region = torch.tensor([[-1.0, 1.0], [-1.0, 1.0]])
 
     problem = LyapunovProblem(nn_lyapunov=nn_lyapunov, dynamics=dynamics, region=region)
 
-    # Verify the Lyapunov function
+    result = verify_lyapunov_nn(problem)
+    print("==============================================")
+    print(f"Origin result: {result['origin']}")
+    print("==============================================")
+    print(f"Positive result: {result['positive']}\n\n")
+    print("==============================================")
+    print(f"Decrease result: {result['decrease']}\n\n")
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
+        print(
+            "Usage: python verify_crown.py <problem.py> [checkpoint.pt]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    problem_path = sys.argv[1]
+    checkpoint_path = sys.argv[2] if len(sys.argv) == 3 else None
+
+    from relu_vnn.__main__ import load_problem_module, _load_model_state
+
+    mod = load_problem_module(problem_path)
+    problem = mod.make_problem()
+
+    if checkpoint_path is not None:
+        ckpt = torch.load(checkpoint_path, weights_only=False)
+        _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
+        print(f"Checkpoint loaded: {checkpoint_path}")
+
     result = verify_lyapunov_nn(problem)
     print("==============================================")
     print(f"Origin result: {result['origin']}")

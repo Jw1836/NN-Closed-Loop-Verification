@@ -39,7 +39,7 @@ class DuffingDynamics(nn.Module):
 
 
 class DuffingLyapunov(nn.Module):
-    def __init__(self, hidden_size: int = 5):
+    def __init__(self, hidden_size: int):
         """Single hidden layer, ReLU activation, output shape (N, 1).
 
         The attribute is named `.network` so hyperplane.py can access
