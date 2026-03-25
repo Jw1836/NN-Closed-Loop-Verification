@@ -1,8 +1,9 @@
 """alpha-beta-CROWN verification of Neural Lyapunov Networks.
 For comparison to hyperplane method."""
 
-from lyapunov import LyapunovProblem
+from relu_vnn.lyapunov import LyapunovProblem
 import torch
+from torch import nn
 from numpy import isclose
 from abcrown import (
     VerificationSpec,
@@ -13,52 +14,62 @@ from abcrown import (
 )
 from abcrown.api import SolveResult
 from typing import Any
+import numpy as np
 
 
-def check_greater_zero(
-    problem: LyapunovProblem, config
+def check_origin(problem: LyapunovProblem, device: torch.device) -> tuple[bool, float]:
+    zero_input = torch.zeros(problem.state_dim, device=device)
+    zero_output = problem.nn_lyapunov(zero_input).item()
+    if isclose(zero_output, 0.0):
+        return (True, zero_output)
+    else:
+        return (False, zero_output)
+
+
+def check_positive(
+    problem: LyapunovProblem, config, hole: float = 0.0001
 ) -> dict[int, tuple[SolveResult, SolveResult]]:
     """V(x) > 0 for all x in region, x != 0.
 
-    The region must contain the origin,
-    so to not check zero does an independent half-plane check along each state dimension."""
+    In practice, check outside of rectangular hole with tesselated rectangles.
+    A good default for the hole is 0.01% of the region size.
+    """
     result = {}
     # Symbolic variables
     x = input_vars(problem.state_dim)
     y = output_vars(1)  # Lyapunov outputs scalar
-    for d in range(problem.state_dim):
-        # This loop does some redundant checking, since we really just need
-        # to not check the origin. But this logic is cleaner for now.
-        # For each dimension, check both half planes
-        d_min = problem.region[d, 0].item()
-        d_max = problem.region[d, 1].item()
-        neg_halfplane = (x[d] > d_min) & (x[d] < 0.0)
-        pos_halfplane = (x[d] > 0.0) & (x[d] < d_max)
-        # Set other dimension bounds to be the full respective region
-        for i in range(problem.state_dim):
-            if i != d:
-                i_min = problem.region[i, 0].item()
-                i_max = problem.region[i, 1].item()
-                neg_halfplane = neg_halfplane & (x[i] > i_min) & (x[i] < i_max)
-                pos_halfplane = pos_halfplane & (x[i] > i_min) & (x[i] < i_max)
-        # Output is simple scalar test
-        output_greater_zero = y[0] > 0.0
-        neg_spec = VerificationSpec.build_spec(
+
+    # Hardcode to the 2D case, four checks
+    x1_min = problem.region[0, 0].item()
+    x1_max = problem.region[0, 1].item()
+    x2_min = problem.region[1, 0].item()
+    x2_max = problem.region[1, 1].item()
+    h1 = (x1_max - x1_min) * hole
+    h2 = (x2_max - x2_min) * hole
+    overlap = 1e-6  # Handle the <= vs < issue with the hole boundary
+    # Think of this as going clockwise around origin, with distance h over axis.
+    # Trailing edge overlaps the previous quadrant to prevent discontinuities.
+    quads = []
+    quads.append(torch.tensor([[-h1 - overlap, x1_max], [h2, x2_max]]))
+    quads.append(torch.tensor([[h1, x1_max], [x2_min, h2 + overlap]]))
+    quads.append(torch.tensor([[x1_min, h1 + overlap], [x2_min, -h2]]))
+    quads.append(torch.tensor([[x1_min, -h1], [-h2 - overlap, x2_max]]))
+
+    # Check each quadrant
+    for q in quads:
+        # Convert bounds to symbolic vars and constraints
+        x1_constraint = (x[0] > q[0][0].item()) & (x[0] < q[0][1].item())
+        x2_constraint = (x[1] > q[1][0].item()) & (x[1] < q[1][1].item())
+        input_constraint = x1_constraint & x2_constraint
+        output_constraint = y[0] > 0.0
+        spec = VerificationSpec.build_spec(
             input_vars=x,
             output_vars=y,
-            input_constraint=neg_halfplane,
-            output_constraint=output_greater_zero,
+            input_constraint=input_constraint,
+            output_constraint=output_constraint,
         )
-        pos_spec = VerificationSpec.build_spec(
-            input_vars=x,
-            output_vars=y,
-            input_constraint=pos_halfplane,
-            output_constraint=output_greater_zero,
-        )
-        # Solve the two specs
-        neg_result = ABCrownSolver(neg_spec, problem.nn_lyapunov, config=config).solve()
-        pos_result = ABCrownSolver(pos_spec, problem.nn_lyapunov, config=config).solve()
-        result[d] = [neg_result, pos_result]
+        # Solve the spec
+        result[q] = ABCrownSolver(spec, problem.nn_lyapunov, config=config).solve()
 
     # Complete for all dimensions
     return result
@@ -71,12 +82,7 @@ def verify_lyapunov_nn(
     verification_result = {}
 
     # V(0) = 0
-    zero_input = torch.zeros(problem.state_dim, device=device)
-    zero_output = problem.nn_lyapunov(zero_input)
-    if isclose(zero_output.item(), 0.0):
-        verification_result["origin"] = (True, f"Zero input ==> {zero_output}.")
-    else:
-        verification_result["origin"] = (False, f"Zero input ==> {zero_output}.")
+    verification_result["origin"] = check_origin(problem, device)
 
     # Build config for abcrown
     config = (
@@ -86,8 +92,7 @@ def verify_lyapunov_nn(
     )
 
     # V(x) > 0 for x != 0, for all x in region
-    result_gt_zero = check_greater_zero(problem, config)
-    verification_result["positive"] = result_gt_zero
+    verification_result["positive"] = check_positive(problem, config)
 
     # dot{V(x)} = DV(x)F(X) < 0, for all x in region
 
@@ -95,21 +100,38 @@ def verify_lyapunov_nn(
 
 
 if __name__ == "__main__":
-    # Example usage
-    from lyapunov import LyapunovProblem
-    from torch import nn
 
-    class TrivialNN(nn.Module):
-        def forward(self, x):
-            return (x**2).sum(dim=-1, keepdim=True)
+    class ReLULyapunov(nn.Module):
+        """V(x) = |x1| + |x2| — valid Lyapunov for f(x) = -x.
 
-    class TrvialDyanamics(nn.Module):
+        dV/dt = sign(x)·(-x) = -|x1| - |x2| < 0.
+        Represented exactly as relu(x1)+relu(-x1)+relu(x2)+relu(-x2).
+        """
+
+        def __init__(self):
+            super().__init__()
+            l1 = nn.Linear(2, 4, bias=False)
+            l1.weight = nn.Parameter(
+                torch.tensor([[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]]),
+                requires_grad=False,
+            )
+            l2 = nn.Linear(4, 1, bias=False)
+            l2.weight = nn.Parameter(
+                torch.tensor([[1.0, 1.0, 1.0, 1.0]]), requires_grad=False
+            )
+            self.network = nn.Sequential(l1, nn.ReLU(), l2)
+
         def forward(self, x):
-            return x
+            return self.network(x)
+
+    class NegativeDynamics(nn.Module):
+        def forward(self, x):
+            return -x
 
     # Define a simple Lyapunov problem
-    nn_lyapunov = TrivialNN()
-    dynamics = TrvialDyanamics()
+    nn_lyapunov = ReLULyapunov()
+    print(nn_lyapunov)
+    dynamics = NegativeDynamics()
     region = torch.tensor([[-1.0, 1.0], [-1.0, 1.0]])  # 2D region
     problem = LyapunovProblem(nn_lyapunov=nn_lyapunov, dynamics=dynamics, region=region)
 
@@ -119,5 +141,4 @@ if __name__ == "__main__":
     print(f"Origin result: {result['origin']}")
     print("==============================================")
     print(f"Positive result: {result['positive']}\n\n")
-    print(f"Dim 0: {result['positive'][0]}\n\n")
-    print(f"Dim 1: {result['positive'][1]}\n\n")
+    print("==============================================")
