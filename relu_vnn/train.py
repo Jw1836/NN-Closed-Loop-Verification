@@ -182,3 +182,4 @@ def finetune(
 
     # Re-zero V(0) after training drift
     problem.update_shift()
+    problem.to("cpu")  # return to CPU so callers need no device management

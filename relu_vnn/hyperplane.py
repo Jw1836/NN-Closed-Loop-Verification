@@ -245,7 +245,10 @@ def enumerate_cells_bfs(
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
-        ctx = mp.get_context("forkserver")
+        import sys
+
+        _can_fork = sys.platform == "linux" and not torch.cuda.is_initialized()
+        ctx = mp.get_context("fork" if _can_fork else "forkserver")
         # Stream results as they arrive instead of draining the full queue per
         # wave.  As each geometry result returns we immediately discover its
         # neighbors and submit them to the executor, so workers stay busy

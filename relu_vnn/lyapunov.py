@@ -357,7 +357,10 @@ class LyapunovProblem:
             n_workers,
         )
         if n_workers > 1:
-            ctx = mp.get_context("forkserver")
+            import sys
+
+            _can_fork = sys.platform == "linux" and not torch.cuda.is_initialized()
+            ctx = mp.get_context("fork" if _can_fork else "forkserver")
             with ctx.Pool(n_workers) as pool:
                 results = pool.map(_check_cell_lie, args_list)
         else:
