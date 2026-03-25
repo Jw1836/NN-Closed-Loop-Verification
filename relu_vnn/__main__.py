@@ -381,23 +381,25 @@ def cmd_verify(args):
         if not os.path.isfile(path):
             print(f"Error: checkpoint not found: {path}", file=sys.stderr)
             sys.exit(1)
-        ckpt = torch.load(path, weights_only=False, map_location="cpu")
+        ckpt = torch.load(path, weights_only=False)
         _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
         print(f"Checkpoint loaded: {path}")
 
-    problem.to("cpu")  # normalise device; verify always runs on CPU
+    device = torch.device(args.device)
+    problem.to(device)
     problem.update_shift()
 
     n_params = sum(p.numel() for p in problem.nn_lyapunov.parameters())
     hidden_size = getattr(problem.nn_lyapunov, "hidden_size", "?")
     print(f"Problem:      {problem}")
     print(f"Lyapunov net: hidden_size={hidden_size}  params={n_params:,}")
-    print(f"Device:       cpu")
+    print(f"Device:       {device}")
     print(
         f"Config:       early_exit={args.early_exit}  max_workers={args.max_workers}  hole={problem.hole}"
     )
     print()
 
+    problem.to("cpu")
     origin_cexs, spatial_cexs, polygons, raw = _run_verify(problem, "Verification")
 
     slug = _problem_slug(problem)
@@ -598,6 +600,7 @@ def _add_common_args(parser: argparse.ArgumentParser):
         "problem_file",
         help="Path to a Python file defining make_problem() -> LyapunovProblem",
     )
+    parser.add_argument("--device", default="cpu", help="torch device (cpu, cuda, mps)")
     parser.add_argument(
         "--early-exit",
         action="store_true",
@@ -665,9 +668,6 @@ def main():
         help="Train a Lyapunov network and run the verify/retrain loop",
     )
     _add_common_args(train_parser)
-    train_parser.add_argument(
-        "--device", default="cpu", help="torch device (cpu, cuda, mps)"
-    )
     train_parser.add_argument(
         "--checkpoint-dir",
         default=None,
