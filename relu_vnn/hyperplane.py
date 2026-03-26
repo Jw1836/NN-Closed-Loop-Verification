@@ -245,6 +245,9 @@ def enumerate_cells_bfs(
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
+        # Experiments show decrease performance past 16 workers, at least in the 2k-4k cell space.
+        n_workers = min(n_workers, 16)
+
         ctx = mp.get_context("forkserver")
         # Stream results as they arrive instead of draining the full queue per
         # wave.  As each geometry result returns we immediately discover its
