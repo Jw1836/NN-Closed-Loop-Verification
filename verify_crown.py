@@ -147,9 +147,12 @@ def check_decrease(
 
 def verify_lyapunov_nn(
     problem: LyapunovProblem,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device,
     hole: float = 0.0001,
 ) -> dict[str, Any]:
+
+    problem.to(device)
+
     # Dict to store verification result
     verification_result = {}
 
@@ -160,8 +163,14 @@ def verify_lyapunov_nn(
     config = (
         ConfigBuilder.from_defaults()
         .set(general__device=device)
-        .set(general__show_adv_example=True)
-        .set(model__with_jacobian=True)
+        .set(general__conv_mode="matrix")  # No convolutions
+        .set(model__with_jacobian=True)  # Needed for decrease condition
+        .set(attack__pgd_order="skip")  # Prevent early exit with false counterexample
+        .set(general__complete_verifier="bab")
+        .set(bab__branching__method="sb")  # Split the input space since low dimension
+        .set(bab__branching__input_split__enable=True)
+        .set(solver__bound_prop_method="backward")  # no "forward" with JacobianOP
+        .set(bab__timeout=3200)
     )
 
     # V(x) > 0 for x != 0, for all x in region
@@ -173,58 +182,15 @@ def verify_lyapunov_nn(
     return verification_result
 
 
-def _test_negative_dynamics():
-    """In-file test: V(x) = |x1| + |x2| is a valid Lyapunov for f(x) = -x.
-
-    dV/dt = sign(x)·(-x) = -|x1| - |x2| < 0.
-    Represented exactly as relu(x1)+relu(-x1)+relu(x2)+relu(-x2).
-    """
-
-    class ReLULyapunov(nn.Module):
-        def __init__(self):
-            super().__init__()
-            l1 = nn.Linear(2, 4, bias=False)
-            l1.weight = nn.Parameter(
-                torch.tensor([[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]]),
-                requires_grad=False,
-            )
-            l2 = nn.Linear(4, 1, bias=False)
-            l2.weight = nn.Parameter(
-                torch.tensor([[1.0, 1.0, 1.0, 1.0]]), requires_grad=False
-            )
-            self.network = nn.Sequential(l1, nn.ReLU(), l2)
-
-        def forward(self, x):
-            return self.network(x)
-
-    class NegativeDynamics(nn.Module):
-        def forward(self, x):
-            return -x
-
-    nn_lyapunov = ReLULyapunov()
-    print(nn_lyapunov)
-    dynamics = NegativeDynamics()
-    region = torch.tensor([[-1.0, 1.0], [-1.0, 1.0]])
-
-    problem = LyapunovProblem(nn_lyapunov=nn_lyapunov, dynamics=dynamics, region=region)
-
-    result = verify_lyapunov_nn(problem)
-    print("==============================================")
-    print(f"Origin result: {result['origin']}")
-    print("==============================================")
-    print(f"Positive result: {result['positive']}\n\n")
-    print("==============================================")
-    print(f"Decrease result: {result['decrease']}\n\n")
-
-
-def _set_origin_shift(net: nn.Module, device):
+def _set_origin_shift(net: nn.Module):
     """Perform a forward pass to find the true zero point of the network."""
     shift = cast(torch.Tensor, net.shift)  # type: ignore[attr-defined]
     shift.zero_()
     state_dim = cast(nn.Linear, cast(nn.Sequential, net.network)[0]).in_features  # type: ignore[attr-defined]
-    zero_input = torch.zeros(state_dim, device=device)
+    zero_input = torch.zeros(state_dim)
     with torch.no_grad():
         value = net(zero_input)
+    print(f"Setting origin shift to {value.item()} based on forward pass.")
     shift.copy_(value.squeeze())
 
 
@@ -246,19 +212,26 @@ if __name__ == "__main__":
     mod = load_problem_module(problem_path)
     problem = mod.make_problem()
 
-    device = torch.device("cpu")
-
-    # Some networks have a torch register_buffer to exactly set the origin to be zero.
-    # By convention, they are named "shift"
-    if hasattr(problem.nn_lyapunov, "shift"):
-        _set_origin_shift(problem.nn_lyapunov, device)
+    if torch.cuda.is_available():
+        print("CUDA is available. Using GPU for verification.")
+        device = torch.device("cuda")
+    else:
+        print("Warning: CUDA not available, trying to use CPU.")
+        device = torch.device("cpu")
 
     if checkpoint_path is not None:
         ckpt = torch.load(checkpoint_path, weights_only=False)
         _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
         print(f"Checkpoint loaded: {checkpoint_path}")
 
-    result = verify_lyapunov_nn(problem)
+    # Some networks have a torch register_buffer to exactly set the origin to be zero.
+    # By convention, they are named "shift". Must run after loading checkpoint so the
+    # shift is computed from the actual trained weights, not random initialization.
+    if hasattr(problem.nn_lyapunov, "shift"):
+        _set_origin_shift(problem.nn_lyapunov)
+
+    result = verify_lyapunov_nn(problem, device)
+
     print("==============================================")
     print(f"Origin result: {result['origin']}")
     print("==============================================")
