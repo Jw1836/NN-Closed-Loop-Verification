@@ -14,16 +14,16 @@ from abcrown import (
 )
 from abcrown.api import SolveResult
 from abcrown.auto_LiRPA.jacobian import JacobianOP
-from typing import Any
+from typing import Any, cast
 
 
-def check_origin(problem: LyapunovProblem, device: torch.device) -> tuple[bool, float]:
+def check_origin(problem: LyapunovProblem, device: torch.device) -> tuple[str, float]:
     zero_input = torch.zeros(problem.state_dim, device=device)
     zero_output = problem.nn_lyapunov(zero_input).item()
     if isclose(zero_output, 0.0):
-        return (True, zero_output)
+        return ("safe", zero_output)
     else:
-        return (False, zero_output)
+        return ("unsafe", zero_output)
 
 
 def check_positive(
@@ -217,6 +217,17 @@ def _test_negative_dynamics():
     print(f"Decrease result: {result['decrease']}\n\n")
 
 
+def _set_origin_shift(net: nn.Module, device):
+    """Perform a forward pass to find the true zero point of the network."""
+    shift = cast(torch.Tensor, net.shift)  # type: ignore[attr-defined]
+    shift.zero_()
+    state_dim = cast(nn.Linear, cast(nn.Sequential, net.network)[0]).in_features  # type: ignore[attr-defined]
+    zero_input = torch.zeros(state_dim, device=device)
+    with torch.no_grad():
+        value = net(zero_input)
+    shift.copy_(value.squeeze())
+
+
 if __name__ == "__main__":
     import sys
 
@@ -235,6 +246,13 @@ if __name__ == "__main__":
     mod = load_problem_module(problem_path)
     problem = mod.make_problem()
 
+    device = torch.device("cpu")
+
+    # Some networks have a torch register_buffer to exactly set the origin to be zero.
+    # By convention, they are named "shift"
+    if hasattr(problem.nn_lyapunov, "shift"):
+        _set_origin_shift(problem.nn_lyapunov, device)
+
     if checkpoint_path is not None:
         ckpt = torch.load(checkpoint_path, weights_only=False)
         _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
@@ -247,3 +265,10 @@ if __name__ == "__main__":
     print(f"Positive result: {result['positive']}\n\n")
     print("==============================================")
     print(f"Decrease result: {result['decrease']}\n\n")
+    print("==============================================")
+    origin_valid = result["origin"][0] == "safe"
+    positive_valid = all(sr.status == "safe" for sr in result["positive"].values())
+    decrease_valid = all(sr.status == "safe" for sr in result["decrease"].values())
+    print(f"Origin:   {'valid' if origin_valid else 'violation'}")
+    print(f"Positive: {'valid' if positive_valid else 'violation'}")
+    print(f"Decrease: {'valid' if decrease_valid else 'violation'}")
