@@ -1,8 +1,9 @@
 """alpha-beta-CROWN verification of Neural Lyapunov Networks.
 For comparison to hyperplane method."""
 
-from lyapunov import LyapunovProblem
+from relu_vnn.lyapunov import LyapunovProblem
 import torch
+from torch import nn
 from numpy import isclose
 from abcrown import (
     VerificationSpec,
@@ -12,112 +13,235 @@ from abcrown import (
     output_vars,
 )
 from abcrown.api import SolveResult
-from typing import Any
+from abcrown.auto_LiRPA.jacobian import JacobianOP
+from typing import Any, cast
 
 
-def check_greater_zero(
-    problem: LyapunovProblem, config
+def check_origin(problem: LyapunovProblem, device: torch.device) -> tuple[str, float]:
+    zero_input = torch.zeros(problem.state_dim, device=device)
+    zero_output = problem.nn_lyapunov(zero_input).item()
+    if isclose(zero_output, 0.0):
+        return ("safe", zero_output)
+    else:
+        return ("unsafe", zero_output)
+
+
+def check_positive(
+    problem: LyapunovProblem, config, hole: float = 0.0001
 ) -> dict[int, tuple[SolveResult, SolveResult]]:
     """V(x) > 0 for all x in region, x != 0.
 
-    The region must contain the origin,
-    so to not check zero does an independent half-plane check along each state dimension."""
+    In practice, check outside of rectangular hole with tesselated rectangles.
+    A good default for the hole is 0.01% of the region size.
+    """
     result = {}
     # Symbolic variables
     x = input_vars(problem.state_dim)
     y = output_vars(1)  # Lyapunov outputs scalar
-    for d in range(problem.state_dim):
-        # This loop does some redundant checking, since we really just need
-        # to not check the origin. But this logic is cleaner for now.
-        # For each dimension, check both half planes
-        d_min = problem.region[d, 0].item()
-        d_max = problem.region[d, 1].item()
-        neg_halfplane = (x[d] > d_min) & (x[d] < 0.0)
-        pos_halfplane = (x[d] > 0.0) & (x[d] < d_max)
-        # Set other dimension bounds to be the full respective region
-        for i in range(problem.state_dim):
-            if i != d:
-                i_min = problem.region[i, 0].item()
-                i_max = problem.region[i, 1].item()
-                neg_halfplane = neg_halfplane & (x[i] > i_min) & (x[i] < i_max)
-                pos_halfplane = pos_halfplane & (x[i] > i_min) & (x[i] < i_max)
-        # Output is simple scalar test
-        output_greater_zero = y[0] > 0.0
-        neg_spec = VerificationSpec.build_spec(
+
+    # Hardcode to the 2D case, four checks
+    x1_min = problem.region[0, 0].item()
+    x1_max = problem.region[0, 1].item()
+    x2_min = problem.region[1, 0].item()
+    x2_max = problem.region[1, 1].item()
+    h1 = (x1_max - x1_min) * hole
+    h2 = (x2_max - x2_min) * hole
+    overlap = 1e-6  # Handle the <= vs < issue with the hole boundary
+    # Think of this as going clockwise around origin, with distance h over axis.
+    # Trailing edge overlaps the previous quadrant to prevent discontinuities.
+    quads = []
+    quads.append(torch.tensor([[-h1 - overlap, x1_max], [h2, x2_max]]))
+    quads.append(torch.tensor([[h1, x1_max], [x2_min, h2 + overlap]]))
+    quads.append(torch.tensor([[x1_min, h1 + overlap], [x2_min, -h2]]))
+    quads.append(torch.tensor([[x1_min, -h1], [-h2 - overlap, x2_max]]))
+
+    # Check each quadrant
+    for q in quads:
+        # Convert bounds to symbolic vars and constraints
+        x1_constraint = (x[0] > q[0][0].item()) & (x[0] < q[0][1].item())
+        x2_constraint = (x[1] > q[1][0].item()) & (x[1] < q[1][1].item())
+        input_constraint = x1_constraint & x2_constraint
+        output_constraint = y[0] > 0.0
+        spec = VerificationSpec.build_spec(
             input_vars=x,
             output_vars=y,
-            input_constraint=neg_halfplane,
-            output_constraint=output_greater_zero,
+            input_constraint=input_constraint,
+            output_constraint=output_constraint,
         )
-        pos_spec = VerificationSpec.build_spec(
+        # Solve the spec
+        result[q] = ABCrownSolver(spec, problem.nn_lyapunov, config=config).solve()
+
+    # Complete for all dimensions
+    return result
+
+
+class DecreaseNetwork(nn.Module):
+    """This network must be negative for all points in region.
+
+    https://github.com/Verified-Intelligence/alpha-beta-CROWN/blob/main/complete_verifier/examples_abcrown/neural_lyapunov_dependency/computation_graph.py#L122-L139
+    """
+
+    def __init__(self, dynamics: nn.Module, nn_lyapunov: nn.Module) -> None:
+        super().__init__()
+        self.dynamics = dynamics
+        self.nn_lyapunov = nn_lyapunov
+
+    def forward(self, x):
+        x = x.clone().requires_grad_(True)
+        V = self.nn_lyapunov(x)
+        # auto_LiRPA function to compute Jacobian, maintaining computation graph
+        dVdx = JacobianOP.apply(V, x).squeeze(1)  # (batch, state_dim)
+        f_x = self.dynamics(x)
+        return torch.sum(dVdx * f_x, dim=1, keepdim=True)
+
+
+def check_decrease(
+    problem: LyapunovProblem, config, hole: float = 0.0001
+) -> dict[int, tuple[SolveResult, SolveResult]]:
+    """dot{V}(x) = DV(x)f(X) < 0 for all x in region, x != 0.
+
+    In practice, check outside of rectangular hole with tesselated rectangles.
+    A good default for the hole is 0.01% of the region size.
+    """
+    result = {}
+    # Symbolic variables
+    x = input_vars(problem.state_dim)
+    y = output_vars(1)  # Lyapunov outputs scalar
+
+    # Hardcode to the 2D case, four checks
+    x1_min = problem.region[0, 0].item()
+    x1_max = problem.region[0, 1].item()
+    x2_min = problem.region[1, 0].item()
+    x2_max = problem.region[1, 1].item()
+    h1 = (x1_max - x1_min) * hole
+    h2 = (x2_max - x2_min) * hole
+    overlap = 1e-6  # Handle the <= vs < issue with the hole boundary
+    # Think of this as going clockwise around origin, with distance h over axis.
+    # Trailing edge overlaps the previous quadrant to prevent discontinuities.
+    quads = []
+    quads.append(torch.tensor([[-h1 - overlap, x1_max], [h2, x2_max]]))
+    quads.append(torch.tensor([[h1, x1_max], [x2_min, h2 + overlap]]))
+    quads.append(torch.tensor([[x1_min, h1 + overlap], [x2_min, -h2]]))
+    quads.append(torch.tensor([[x1_min, -h1], [-h2 - overlap, x2_max]]))
+
+    # Check each quadrant
+    for q in quads:
+        # Convert bounds to symbolic vars and constraints
+        x1_constraint = (x[0] > q[0][0].item()) & (x[0] < q[0][1].item())
+        x2_constraint = (x[1] > q[1][0].item()) & (x[1] < q[1][1].item())
+        input_constraint = x1_constraint & x2_constraint
+        output_constraint = y[0] < 0.0
+        spec = VerificationSpec.build_spec(
             input_vars=x,
             output_vars=y,
-            input_constraint=pos_halfplane,
-            output_constraint=output_greater_zero,
+            input_constraint=input_constraint,
+            output_constraint=output_constraint,
         )
-        # Solve the two specs
-        neg_result = ABCrownSolver(neg_spec, problem.nn_lyapunov, config=config).solve()
-        pos_result = ABCrownSolver(pos_spec, problem.nn_lyapunov, config=config).solve()
-        result[d] = [neg_result, pos_result]
+        # Solve the spec
+        model = DecreaseNetwork(problem.dynamics, problem.nn_lyapunov)
+        result[q] = ABCrownSolver(spec, model, config=config).solve()
 
     # Complete for all dimensions
     return result
 
 
 def verify_lyapunov_nn(
-    problem: LyapunovProblem, device: torch.device = torch.device("cpu")
+    problem: LyapunovProblem,
+    device: torch.device,
+    hole: float = 0.0001,
 ) -> dict[str, Any]:
+
+    problem.to(device)
+
     # Dict to store verification result
     verification_result = {}
 
     # V(0) = 0
-    zero_input = torch.zeros(problem.state_dim, device=device)
-    zero_output = problem.nn_lyapunov(zero_input)
-    if isclose(zero_output.item(), 0.0):
-        verification_result["origin"] = (True, f"Zero input ==> {zero_output}.")
-    else:
-        verification_result["origin"] = (False, f"Zero input ==> {zero_output}.")
+    verification_result["origin"] = check_origin(problem, device)
 
     # Build config for abcrown
     config = (
         ConfigBuilder.from_defaults()
         .set(general__device=device)
-        .set(general__show_adv_example=True)
+        .set(general__conv_mode="matrix")  # No convolutions
+        .set(model__with_jacobian=True)  # Needed for decrease condition
+        .set(attack__pgd_order="skip")  # Prevent early exit with false counterexample
+        .set(general__complete_verifier="bab")
+        .set(bab__branching__method="sb")  # Split the input space since low dimension
+        .set(bab__branching__input_split__enable=True)
+        .set(solver__bound_prop_method="backward")  # no "forward" with JacobianOP
+        .set(bab__timeout=3200)
     )
 
     # V(x) > 0 for x != 0, for all x in region
-    result_gt_zero = check_greater_zero(problem, config)
-    verification_result["positive"] = result_gt_zero
+    verification_result["positive"] = check_positive(problem, config, hole)
 
     # dot{V(x)} = DV(x)F(X) < 0, for all x in region
+    verification_result["decrease"] = check_decrease(problem, config, hole)
 
     return verification_result
 
 
+def _set_origin_shift(net: nn.Module):
+    """Perform a forward pass to find the true zero point of the network."""
+    shift = cast(torch.Tensor, net.shift)  # type: ignore[attr-defined]
+    shift.zero_()
+    state_dim = cast(nn.Linear, cast(nn.Sequential, net.network)[0]).in_features  # type: ignore[attr-defined]
+    zero_input = torch.zeros(state_dim)
+    with torch.no_grad():
+        value = net(zero_input)
+    print(f"Setting origin shift to {value.item()} based on forward pass.")
+    shift.copy_(value.squeeze())
+
+
 if __name__ == "__main__":
-    # Example usage
-    from lyapunov import LyapunovProblem
-    from torch import nn
+    import sys
 
-    class TrivialNN(nn.Module):
-        def forward(self, x):
-            return (x**2).sum(dim=-1, keepdim=True)
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
+        print(
+            "Usage: python verify_crown.py <problem.py> [checkpoint.pt]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
-    class TrvialDyanamics(nn.Module):
-        def forward(self, x):
-            return x
+    problem_path = sys.argv[1]
+    checkpoint_path = sys.argv[2] if len(sys.argv) == 3 else None
 
-    # Define a simple Lyapunov problem
-    nn_lyapunov = TrivialNN()
-    dynamics = TrvialDyanamics()
-    region = torch.tensor([[-1.0, 1.0], [-1.0, 1.0]])  # 2D region
-    problem = LyapunovProblem(nn_lyapunov=nn_lyapunov, dynamics=dynamics, region=region)
+    from relu_vnn.__main__ import load_problem_module, _load_model_state
 
-    # Verify the Lyapunov function
-    result = verify_lyapunov_nn(problem)
+    mod = load_problem_module(problem_path)
+    problem = mod.make_problem()
+
+    if torch.cuda.is_available():
+        print("CUDA is available. Using GPU for verification.")
+        device = torch.device("cuda")
+    else:
+        print("Warning: CUDA not available, trying to use CPU.")
+        device = torch.device("cpu")
+
+    if checkpoint_path is not None:
+        ckpt = torch.load(checkpoint_path, weights_only=False)
+        _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
+        print(f"Checkpoint loaded: {checkpoint_path}")
+
+    # Some networks have a torch register_buffer to exactly set the origin to be zero.
+    # By convention, they are named "shift". Must run after loading checkpoint so the
+    # shift is computed from the actual trained weights, not random initialization.
+    if hasattr(problem.nn_lyapunov, "shift"):
+        _set_origin_shift(problem.nn_lyapunov)
+
+    result = verify_lyapunov_nn(problem, device)
+
     print("==============================================")
     print(f"Origin result: {result['origin']}")
     print("==============================================")
     print(f"Positive result: {result['positive']}\n\n")
-    print(f"Dim 0: {result['positive'][0]}\n\n")
-    print(f"Dim 1: {result['positive'][1]}\n\n")
+    print("==============================================")
+    print(f"Decrease result: {result['decrease']}\n\n")
+    print("==============================================")
+    origin_valid = result["origin"][0] == "safe"
+    positive_valid = all(sr.status == "safe" for sr in result["positive"].values())
+    decrease_valid = all(sr.status == "safe" for sr in result["decrease"].values())
+    print(f"Origin:   {'valid' if origin_valid else 'violation'}")
+    print(f"Positive: {'valid' if positive_valid else 'violation'}")
+    print(f"Decrease: {'valid' if decrease_valid else 'violation'}")
