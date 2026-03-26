@@ -465,7 +465,9 @@ class LyapunovProblem:
 
         logger.info("Enumerating cells via BFS...")
         t0 = time.perf_counter()
-        cells = enumerate_cells_bfs(W_matrix, B_vector, bbox_hs, region_np)
+        cells = enumerate_cells_bfs(
+            W_matrix, B_vector, bbox_hs, region_np, n_workers=self.max_workers
+        )
         logger.info("  done (%.3fs)  — %d cells", time.perf_counter() - t0, len(cells))
         return cells
 

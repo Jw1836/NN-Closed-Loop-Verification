@@ -126,11 +126,36 @@ def find_chebyshev_center(halfspaces: np.ndarray) -> np.ndarray | None:
     return None
 
 
+def _bfs_geometry_worker(
+    args: tuple,
+) -> tuple[HalfspaceIntersection | None, bool]:
+    """Worker for parallel BFS: solve Chebyshev LP + Qhull for one cell.
+
+    Must be a module-level function for pickling with forkserver/spawn.
+    Args: (hs, state_dim) where hs is the halfspace matrix (n_constraints, state_dim+1).
+    Returns: (HalfspaceIntersection | None, feasible).
+    """
+    from scipy.spatial import QhullError
+
+    hs, state_dim = args
+    interior = find_chebyshev_center(hs)
+    if interior is None:
+        return None, False
+    try:
+        hs_obj = HalfspaceIntersection(hs, interior, incremental=False)
+    except QhullError:
+        return None, False
+    if len(hs_obj.intersections) < state_dim + 1:
+        return None, False
+    return hs_obj, True
+
+
 def enumerate_cells_bfs(
     W_matrix: np.ndarray,
     B_vector: np.ndarray,
     bbox_hs: np.ndarray,
     region: np.ndarray,
+    n_workers: int = 1,
 ) -> list[HalfspaceIntersection]:
     """Enumerate all non-empty cells of the ReLU hyperplane arrangement via BFS.
 
@@ -184,84 +209,95 @@ def enumerate_cells_bfs(
     # ReLU hyperplane) with another cell, so BFS from any seed reaches all of
     # them.
     visited: set[ActivationPattern] = set()
-    queue: deque[tuple[ActivationPattern, np.ndarray]] = deque()
+    queue: deque[ActivationPattern] = deque()
     for pt in seed_points:
         sigma = compute_activation_pattern(W_matrix, B_vector, pt)
         if sigma not in visited:
             visited.add(sigma)
-            queue.append((sigma, pt))
+            queue.append(sigma)
     cells: list[HalfspaceIntersection] = []
 
-    while queue:
-        sigma, hint = queue.popleft()
-
-        # Build the halfspace system: n ReLU constraints + 2*state_dim
-        # bounding-box walls.  Each row is [a1, ..., an, b] meaning a·x + b ≤ 0.
-        # Vectorized: select pre-computed active/inactive rows by pattern.
+    def _build_hs(sigma: ActivationPattern) -> np.ndarray:
         pattern_arr = np.array(sigma, dtype=bool)
         hs = np.empty((n_hidden + n_bbox, state_dim + 1))
         hs[:n_bbox] = bbox_hs
         hs[n_bbox:][pattern_arr] = neuron_hs_active[pattern_arr]
         hs[n_bbox:][~pattern_arr] = neuron_hs_inactive[~pattern_arr]
+        return hs
 
-        # --- Find a strictly interior point (required by HalfspaceIntersection) ---
-        # Fast path: the hint (reflected interior of the parent cell) is often
-        # already strictly feasible, saving an LP solve.
-        hint_violations = hs[:, :-1] @ hint + hs[:, -1]
-        if np.all(hint_violations < -EPS):
-            interior = hint
-        else:
-            # Slow path: solve the Chebyshev-center LP for the largest
-            # inscribed ball.  Returns None when the cell is infeasible
-            # (activation pattern has no realizable region in the domain).
-            interior = find_chebyshev_center(hs)
-            if interior is None:
-                continue
-
-        # --- Compute cell vertices ---
-        try:
-            hs_obj = HalfspaceIntersection(
-                hs,
-                interior,
-                incremental=False,
-            )
-        except QhullError:
-            continue  # degenerate (e.g. numerically flat cell)
-
-        raw_verts = hs_obj.intersections
-
-        if len(raw_verts) < state_dim + 1:
-            continue
-
-        cells.append(hs_obj)
-
-        # --- Discover neighboring cells ---
+    def _discover_neighbors(sigma: ActivationPattern, raw_verts: np.ndarray) -> None:
         # Evaluate all neuron pre-activations w_i · v + b_i at every vertex.
         # A hyperplane is "tight" if any vertex has |pre-activation| < EPS,
         # meaning the cell shares a facet with the cell on the other side of
         # that hyperplane — this is the adjacency condition in the arrangement
         # graph.  Vectorized: all n hyperplanes × all k vertices at once.
-        # Using raw_verts directly (duplicates don't affect np.any).
         all_values = raw_verts @ W_matrix + B_vector  # (k, n_hidden)
         tight_mask = np.any(np.abs(all_values) < EPS, axis=0)  # (n_hidden,)
-
         for i in np.where(tight_mask)[0]:
-            # Flip bit i to get the neighbor's activation pattern
             neighbor = list(sigma)
             neighbor[i] = not neighbor[i]
             neighbor_pat = tuple(neighbor)
             if neighbor_pat not in visited:
                 visited.add(neighbor_pat)
-                # Reflect interior across hyperplane i: x' = x - 2·((w·x+b)/(w·w))·w.
-                # Since `interior` is strictly inside the current cell, the
-                # reflected point typically lands strictly inside the neighbor
-                # cell on the other side of hyperplane i.  This provides a
-                # "free" interior point, avoiding the expensive Chebyshev LP.
-                w = W_matrix[:, i]
-                b = B_vector[i]
-                dist = (w @ interior + b) / (w @ w)
-                neighbor_hint = interior - 2 * dist * w
-                queue.append((neighbor_pat, neighbor_hint))
+                queue.append(neighbor_pat)
+
+    if n_workers > 1:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+
+        # Experiments show decrease performance past 16 workers, at least in the 2k-4k cell space.
+        n_workers = min(n_workers, 16)
+
+        ctx = mp.get_context("forkserver")
+        # Stream results as they arrive instead of draining the full queue per
+        # wave.  As each geometry result returns we immediately discover its
+        # neighbors and submit them to the executor, so workers stay busy
+        # across BFS wave boundaries rather than idling between phases.
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+            pending: dict = {}  # future -> sigma
+
+            def _submit_queue() -> None:
+                while queue:
+                    sigma = queue.popleft()
+                    f = executor.submit(
+                        _bfs_geometry_worker, (_build_hs(sigma), state_dim)
+                    )
+                    pending[f] = sigma
+
+            _submit_queue()  # seed from initial BFS queue
+
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    sigma = pending.pop(future)
+                    hs_obj, feasible = future.result()
+                    if feasible and hs_obj is not None:
+                        cells.append(hs_obj)
+                        _discover_neighbors(sigma, hs_obj.intersections)
+                _submit_queue()  # submit any neighbors just discovered
+    else:
+        # Single-threaded path: LP + Qhull inline (original behaviour).
+        from scipy.spatial import QhullError
+
+        while queue:
+            sigma = queue.popleft()
+            hs = _build_hs(sigma)
+
+            interior = find_chebyshev_center(hs)
+            if interior is None:
+                continue
+
+            try:
+                hs_obj = HalfspaceIntersection(hs, interior, incremental=False)
+            except QhullError:
+                continue
+
+            raw_verts = hs_obj.intersections
+            if len(raw_verts) < state_dim + 1:
+                continue
+
+            cells.append(hs_obj)
+            _discover_neighbors(sigma, raw_verts)
 
     # ── Sanity check: activation-pattern sampling ─────────────────────────
     # Verify BFS completeness by sampling random points in the bounding box
