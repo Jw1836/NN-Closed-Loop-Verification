@@ -26,43 +26,67 @@ def check_origin(problem: LyapunovProblem, device: torch.device) -> tuple[str, f
         return ("unsafe", zero_output)
 
 
+def _build_slabs(
+    region: torch.Tensor, hole: float, overlap: float = 1e-6
+) -> list[torch.Tensor]:
+    """Build 2*N slabs tiling the region minus a hole around origin.
+
+    Dimensions are peeled in order: slab for dim d restricts dims 0..d-1
+    to the hole range (already covered), keeping dims d+1..N-1 at full range.
+    Overlap extends outward from the hole so adjacent slabs slightly overlap.
+
+    Returns list of (state_dim, 2) tensors with [min, max] per dimension.
+    """
+    state_dim = region.shape[0]
+    # Precompute hole half-width per dimension
+    h = [(region[d, 1].item() - region[d, 0].item()) * hole for d in range(state_dim)]
+
+    slabs = []
+    for d in range(state_dim):
+        for sign in (+1, -1):
+            slab = region.clone()
+            # Dims 0..d-1: restrict to hole range + overlap (already covered)
+            for prev in range(d):
+                slab[prev, 0] = -h[prev] - overlap
+                slab[prev, 1] = h[prev] + overlap
+            # Dim d: split at hole boundary
+            if sign == +1:
+                slab[d, 0] = h[d]
+            else:
+                slab[d, 1] = -h[d]
+            # Dims d+1..N-1: full range (already from region.clone())
+            slabs.append(slab)
+
+    return slabs
+
+
+def _build_input_constraint(x, slab: torch.Tensor):
+    """Build ab-CROWN input constraint from symbolic vars and a slab bounds tensor."""
+    constraint = (x[0] > slab[0, 0].item()) & (x[0] < slab[0, 1].item())
+    for d in range(1, slab.shape[0]):
+        constraint = (
+            constraint & (x[d] > slab[d, 0].item()) & (x[d] < slab[d, 1].item())
+        )
+    return constraint
+
+
 def check_positive(
-    problem: LyapunovProblem, config, hole: float = 0.0001
+    problem: LyapunovProblem, config, hole: float
 ) -> dict[int, tuple[SolveResult, SolveResult]]:
     """V(x) > 0 for all x in region, x != 0.
 
-    In practice, check outside of rectangular hole with tesselated rectangles.
-    A good default for the hole is 0.01% of the region size.
+    In practice, check outside of hyper rectangular hole with tessellated hyper rectangles.
+    A good default for the hole is 0.1% of the region size.
     """
     config.set(solver__bound_prop_method="forward+backward")  # propagate both ways
 
     result = {}
-    # Symbolic variables
     x = input_vars(problem.state_dim)
     y = output_vars(1)  # Lyapunov outputs scalar
+    slabs = _build_slabs(problem.region, hole)
 
-    # Hardcode to the 2D case, four checks
-    x1_min = problem.region[0, 0].item()
-    x1_max = problem.region[0, 1].item()
-    x2_min = problem.region[1, 0].item()
-    x2_max = problem.region[1, 1].item()
-    h1 = (x1_max - x1_min) * hole
-    h2 = (x2_max - x2_min) * hole
-    overlap = 1e-6  # Handle the <= vs < issue with the hole boundary
-    # Think of this as going clockwise around origin, with distance h over axis.
-    # Trailing edge overlaps the previous quadrant to prevent discontinuities.
-    quads = []
-    quads.append(torch.tensor([[-h1 - overlap, x1_max], [h2, x2_max]]))
-    quads.append(torch.tensor([[h1, x1_max], [x2_min, h2 + overlap]]))
-    quads.append(torch.tensor([[x1_min, h1 + overlap], [x2_min, -h2]]))
-    quads.append(torch.tensor([[x1_min, -h1], [-h2 - overlap, x2_max]]))
-
-    # Check each quadrant
-    for q in quads:
-        # Convert bounds to symbolic vars and constraints
-        x1_constraint = (x[0] > q[0][0].item()) & (x[0] < q[0][1].item())
-        x2_constraint = (x[1] > q[1][0].item()) & (x[1] < q[1][1].item())
-        input_constraint = x1_constraint & x2_constraint
+    for slab in slabs:
+        input_constraint = _build_input_constraint(x, slab)
         output_constraint = y[0] > 0.0
         spec = VerificationSpec.build_spec(
             input_vars=x,
@@ -70,17 +94,15 @@ def check_positive(
             input_constraint=input_constraint,
             output_constraint=output_constraint,
         )
-        # Solve the spec
-        result[q] = ABCrownSolver(spec, problem.nn_lyapunov, config=config).solve()
+        result[slab] = ABCrownSolver(spec, problem.nn_lyapunov, config=config).solve()
 
-    # Complete for all dimensions
     return result
 
 
 class DecreaseNetwork(nn.Module):
     """This network must be negative for all points in region.
 
-    https://github.com/Verified-Intelligence/alpha-beta-CROWN/blob/main/complete_verifier/examples_abcrown/neural_lyapunov_dependency/computation_graph.py#L122-L139
+    See Verified-Intelligence/alpha-beta-CROWN computation_graph.py#L122-L139
     """
 
     def __init__(self, dynamics: nn.Module, nn_lyapunov: nn.Module) -> None:
@@ -98,43 +120,23 @@ class DecreaseNetwork(nn.Module):
 
 
 def check_decrease(
-    problem: LyapunovProblem, config, hole: float = 0.0001
+    problem: LyapunovProblem, config, hole: float
 ) -> dict[int, tuple[SolveResult, SolveResult]]:
     """dot{V}(x) = DV(x)f(X) < 0 for all x in region, x != 0.
 
-    In practice, check outside of rectangular hole with tesselated rectangles.
-    A good default for the hole is 0.01% of the region size.
+    In practice, check outside of hyper rectangular hole with tessellated hyper rectangles.
+    A good default for the hole is 0.1% of the region size.
     """
     config.set(model__with_jacobian=True)  # Needed for decrease condition
     config.set(solver__bound_prop_method="backward")  # no "forward" with JacobianOP
 
     result = {}
-    # Symbolic variables
     x = input_vars(problem.state_dim)
     y = output_vars(1)  # Lyapunov outputs scalar
+    slabs = _build_slabs(problem.region, hole)
 
-    # Hardcode to the 2D case, four checks
-    x1_min = problem.region[0, 0].item()
-    x1_max = problem.region[0, 1].item()
-    x2_min = problem.region[1, 0].item()
-    x2_max = problem.region[1, 1].item()
-    h1 = (x1_max - x1_min) * hole
-    h2 = (x2_max - x2_min) * hole
-    overlap = 1e-6  # Handle the <= vs < issue with the hole boundary
-    # Think of this as going clockwise around origin, with distance h over axis.
-    # Trailing edge overlaps the previous quadrant to prevent discontinuities.
-    quads = []
-    quads.append(torch.tensor([[-h1 - overlap, x1_max], [h2, x2_max]]))
-    quads.append(torch.tensor([[h1, x1_max], [x2_min, h2 + overlap]]))
-    quads.append(torch.tensor([[x1_min, h1 + overlap], [x2_min, -h2]]))
-    quads.append(torch.tensor([[x1_min, -h1], [-h2 - overlap, x2_max]]))
-
-    # Check each quadrant
-    for q in quads:
-        # Convert bounds to symbolic vars and constraints
-        x1_constraint = (x[0] > q[0][0].item()) & (x[0] < q[0][1].item())
-        x2_constraint = (x[1] > q[1][0].item()) & (x[1] < q[1][1].item())
-        input_constraint = x1_constraint & x2_constraint
+    for slab in slabs:
+        input_constraint = _build_input_constraint(x, slab)
         output_constraint = y[0] < 0.0
         spec = VerificationSpec.build_spec(
             input_vars=x,
@@ -142,18 +144,16 @@ def check_decrease(
             input_constraint=input_constraint,
             output_constraint=output_constraint,
         )
-        # Solve the spec
         model = DecreaseNetwork(problem.dynamics, problem.nn_lyapunov)
-        result[q] = ABCrownSolver(spec, model, config=config).solve()
+        result[slab] = ABCrownSolver(spec, model, config=config).solve()
 
-    # Complete for all dimensions
     return result
 
 
 def verify_lyapunov_nn(
     problem: LyapunovProblem,
     device: torch.device,
-    hole: float = 0.0001,
+    hole: float = 0.001,
 ) -> dict[str, Any]:
 
     problem.to(device)
@@ -169,10 +169,13 @@ def verify_lyapunov_nn(
         ConfigBuilder.from_defaults()
         .set(general__device=device)
         .set(attack__pgd_order="skip")  # Prevent early exit with false counterexample
+        .set(
+            general__enable_incomplete_verification=False
+        )  # Force complete (BaB) verification
         .set(general__complete_verifier="bab")
         .set(bab__branching__method="sb")  # Split the input space since low dimension
         .set(bab__branching__input_split__enable=True)
-        .set(bab__timeout=3200)
+        .set(bab__timeout=3600)  # 1 hour per quadrant
     )
 
     # V(x) > 0 for x != 0, for all x in region
@@ -197,22 +200,36 @@ def _set_origin_shift(net: nn.Module):
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    if len(sys.argv) < 2 or len(sys.argv) > 3:
-        print(
-            "Usage: python verify_crown.py <problem.py> [checkpoint.pt]",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="alpha-beta-CROWN Lyapunov verification"
+    )
+    parser.add_argument("problem_file", help="Path to a problem .py file")
+    parser.add_argument(
+        "checkpoint", nargs="?", default=None, help="Path to a .pt checkpoint"
+    )
+    parser.add_argument(
+        "--hidden-size", type=int, default=None, help="Hidden layer size"
+    )
+    args = parser.parse_args()
 
-    problem_path = sys.argv[1]
-    checkpoint_path = sys.argv[2] if len(sys.argv) == 3 else None
+    problem_path = args.problem_file
+    checkpoint_path = args.checkpoint
 
     from relu_vnn.__main__ import load_problem_module, _load_model_state
 
     mod = load_problem_module(problem_path)
-    problem = mod.make_problem()
+
+    hidden_size = args.hidden_size
+    if checkpoint_path is not None and hidden_size is None:
+        ckpt_tmp = torch.load(checkpoint_path, weights_only=False)
+        w = ckpt_tmp["model_state"].get("network.0.weight")
+        if w is not None:
+            hidden_size = w.shape[0]
+
+    kwargs = {} if hidden_size is None else {"hidden_size": hidden_size}
+    problem = mod.make_problem(**kwargs)
 
     if torch.cuda.is_available():
         print("CUDA is available. Using GPU for verification.")
