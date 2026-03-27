@@ -1,6 +1,7 @@
 """Checkpoint save/load helpers for the Lyapunov training loop."""
 
 import os
+import re
 
 import torch
 
@@ -44,15 +45,24 @@ def load_checkpoint(checkpoint_dir: str, tag: str):
 
 
 def find_resume_point(
-    checkpoint_dir: str, max_iterations: int, problem: LyapunovProblem
+    checkpoint_dir: str, problem: LyapunovProblem
 ) -> tuple[int, list[list[tuple]]]:
-    """Scan checkpoints newest-first; return (start_iteration, cex_history)."""
-    for i in range(max_iterations - 1, -1, -1):
-        ckpt = load_checkpoint(checkpoint_dir, f"iter_{i}")
-        if ckpt is not None:
-            _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
-            problem.update_shift()
-            cex_history = ckpt.get("cex_history", [])
-            print(f"Resuming from iteration {i + 1}")
-            return i + 1, cex_history
-    return 0, []
+    """Scan dir for highest iter_N.pt; load it and return (N, cex_history), or (-1, [])."""
+    highest = -1
+    if os.path.isdir(checkpoint_dir):
+        for fname in os.listdir(checkpoint_dir):
+            m = re.match(r"^iter_(\d+)\.pt$", fname)
+            if m:
+                highest = max(highest, int(m.group(1)))
+
+    if highest == -1:
+        return -1, []
+
+    ckpt = load_checkpoint(checkpoint_dir, f"iter_{highest}")
+    if ckpt is None:
+        return -1, []
+    _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
+    problem.update_shift()
+    cex_history = ckpt.get("cex_history", [])
+    print(f"Resuming from iter_{highest}.pt")
+    return highest, cex_history

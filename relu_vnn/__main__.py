@@ -36,7 +36,6 @@ from .train import (
 )
 from .checkpoint import (
     save_checkpoint,
-    load_checkpoint,
     _load_model_state,
     find_resume_point,
 )
@@ -147,6 +146,19 @@ def _run_verify(
     origin_cexs, spatial_cexs, cell_coords = _unpack_verify(raw)
     _print_verify_summary(origin_cexs, spatial_cexs, label=label)
     return origin_cexs, spatial_cexs, cell_coords, raw
+
+
+def _read_cex_csv(path: str) -> list[tuple]:
+    """Read counterexamples from a CSV written by _write_cex_csv.
+
+    Returns tuples of (x1, ..., xN, value) — same shape finetune() expects.
+    """
+    rows = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(tuple(float(v) for k, v in row.items() if k != "check"))
+    return rows
 
 
 def _write_cex_csv(output_path: str, raw_results: dict, state_dim: int):
@@ -305,78 +317,49 @@ def cmd_train(args):
     )
     print()
 
-    # ── Check for mid-loop resume point first ────────────────────────────────
-    # Peek at iter checkpoints before deciding whether to train, so we don't
-    # re-train from scratch when only initial_train.pt is missing.
-    start_iteration, cex_history = find_resume_point(
-        checkpoint_dir, args.max_iterations, problem
-    )
+    # ── Resume or start from scratch ──────────────────────────────────────────
+    start_iteration, cex_history = find_resume_point(checkpoint_dir, problem)
 
-    if start_iteration > 0:
-        # Model already loaded from iter checkpoint — skip training and initial verify
+    if start_iteration == -1:
+        # No checkpoints found — train from scratch and save iter_0
+        problem.to(device)
+        train_initial(
+            problem,
+            grid_pts=args.grid_pts,  # None → heuristic inside train_initial
+            epochs=args.epochs,
+            lr=args.lr,
+            alpha=args.alpha,
+        )
+        problem.update_shift()
+        save_checkpoint(checkpoint_dir, "iter_0", problem, iteration=0, cex_history=[])
+        start_iteration = 0
+        cex_history = []
+    else:
         problem.to(device)
         problem.update_shift()
-    else:
-        # ── Initial training (or resume from initial_train.pt) ────────────────
-        ckpt = load_checkpoint(checkpoint_dir, "initial_train")
-        if ckpt is not None:
-            _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
-            problem.to(device)
-            problem.update_shift()
-            print("Skipping initial training — loaded from checkpoint.")
-        else:
-            problem.to(device)
-            train_initial(
-                problem,
-                grid_pts=args.grid_pts,  # None → heuristic inside train_initial
-                epochs=args.epochs,
-                lr=args.lr,
-                alpha=args.alpha,
-            )
-            problem.update_shift()
-            save_checkpoint(checkpoint_dir, "initial_train", problem)
-
-        # ── Initial verification ──────────────────────────────────────────────
-        problem.to("cpu")
-        origin_cexs, spatial_cexs, polygons, raw_initial = _run_verify(
-            problem, "Initial verification"
-        )
-        _write_cex_csv(
-            os.path.join(checkpoint_dir, "initial_counterexamples.csv"),
-            raw_initial,
-            problem.state_dim,
-        )
-        plot_verification(
-            checkpoint_dir,
-            "initial_verification.png",
-            problem,
-            origin_cexs + spatial_cexs,
-            polygons,
-            plot_grid_pts,
-            "Hyperplane verification: polygon tessellation + counterexamples",
-        )
-
-        if not origin_cexs and not spatial_cexs:
-            return
 
     # ── Verification / retrain loop ───────────────────────────────────────────
     for i in range(start_iteration, args.max_iterations):
         start = time.time()
-        problem.to("cpu")
-        origin_cexs, spatial_cexs, _, raw = _run_verify(problem, f"Iteration {i}")
-        _write_cex_csv(
-            os.path.join(checkpoint_dir, f"iter_{i}_counterexamples.csv"),
-            raw,
-            problem.state_dim,
-        )
-        cexs = origin_cexs + spatial_cexs
+        csv_path = os.path.join(checkpoint_dir, f"iter_{i}_counterexamples.csv")
+
+        if os.path.exists(csv_path):
+            # Verification was already done for this checkpoint — load cexs and retrain
+            print(f"Loading counterexamples from {csv_path}")
+            cexs = _read_cex_csv(csv_path)
+            print(f"  {len(cexs)} counterexample(s) loaded.")
+        else:
+            problem.to("cpu")
+            origin_cexs, spatial_cexs, _, raw = _run_verify(problem, f"Iteration {i}")
+            _write_cex_csv(csv_path, raw, problem.state_dim)
+            append_verify_log(verify_log, i, raw)
+            cexs = origin_cexs + spatial_cexs
+
         cex_history.append(cexs)
 
         if not cexs:
             print("No counterexamples — done.")
             break
-
-        append_verify_log(verify_log, i, raw)
 
         finetune(
             problem,
@@ -391,9 +374,9 @@ def cmd_train(args):
         print(f"Iteration {i} completed in {time.time() - start:.2f}s\n")
         save_checkpoint(
             checkpoint_dir,
-            f"iter_{i}",
+            f"iter_{i + 1}",
             problem,
-            iteration=i,
+            iteration=i + 1,
             cex_history=cex_history,
         )
 
