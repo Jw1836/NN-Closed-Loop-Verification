@@ -214,7 +214,7 @@ class LyapunovProblem:
         self.dynamics = dynamics
         self.region = region
         self.device = device
-        self.hole: float = 1e-6  # Exclusion radius around origin
+        self.hole: float = 0.0  # Set by CLI command handlers
         self.early_exit: bool = False
         self.max_workers: int = max_workers
 

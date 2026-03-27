@@ -363,10 +363,7 @@ def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem)
 
 def cmd_verify(args):
     mod = load_problem_module(args.problem_file)
-    kwargs = {}
-    if args.hidden_size is not None:
-        kwargs["hidden_size"] = args.hidden_size
-    problem = mod.make_problem(**kwargs)
+    problem = mod.make_problem()
 
     problem.early_exit = args.early_exit
     problem.max_workers = args.max_workers
@@ -390,7 +387,10 @@ def cmd_verify(args):
     problem.update_shift()
 
     n_params = sum(p.numel() for p in problem.nn_lyapunov.parameters())
-    hidden_size = getattr(problem.nn_lyapunov, "hidden_size", "?")
+    hidden_size = (
+        getattr(problem.nn_lyapunov, "hidden_size", None)
+        or problem.nn_lyapunov.network[0].out_features
+    )
     print(f"Problem:      {problem}")
     print(f"Lyapunov net: hidden_size={hidden_size}  params={n_params:,}")
     print(f"Device:       {device}")
@@ -451,7 +451,10 @@ def cmd_train(args):
 
     # ── Print config ──────────────────────────────────────────────────────────
     n_params = sum(p.numel() for p in problem.nn_lyapunov.parameters())
-    hidden_size = getattr(problem.nn_lyapunov, "hidden_size", "?")
+    hidden_size = (
+        getattr(problem.nn_lyapunov, "hidden_size", None)
+        or problem.nn_lyapunov.network[0].out_features
+    )
     _initial_grid = (
         args.grid_pts
         if args.grid_pts is not None
@@ -620,12 +623,6 @@ def _add_common_args(parser: argparse.ArgumentParser):
         help="Exclusion radius around origin: positivity and decrease counterexamples within this ball are not required (default: 0.1%% of smallest region span)",
     )
     parser.add_argument(
-        "--hidden-size",
-        type=int,
-        default=None,
-        help="Override hidden layer size in the Lyapunov net",
-    )
-    parser.add_argument(
         "--grid-pts",
         type=int,
         default=None,
@@ -668,6 +665,12 @@ def main():
         help="Train a Lyapunov network and run the verify/retrain loop",
     )
     _add_common_args(train_parser)
+    train_parser.add_argument(
+        "--hidden-size",
+        type=int,
+        default=None,
+        help="Override hidden layer size in the Lyapunov net",
+    )
     train_parser.add_argument(
         "--checkpoint-dir",
         default=None,
