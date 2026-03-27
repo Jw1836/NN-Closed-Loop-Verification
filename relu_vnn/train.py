@@ -127,6 +127,8 @@ def finetune(
     Uses L-BFGS with strong Wolfe line search — well-suited for polishing a
     nearly-correct solution on a fixed dataset.
     """
+    print("Finetune training...")
+
     if grid_pts is None:
         grid_pts = default_finetune_grid_pts(problem)
     problem.to(device)
@@ -177,8 +179,7 @@ def finetune(
     for epoch in range(epochs):
         model.train()
         loss = optimizer.step(closure)
-        if (epoch + 1) % 10 == 0:
-            print(f"  retrain epoch [{epoch + 1}/{epochs}]  loss={loss.item():.7f}")
+        print(f"  retrain epoch [{epoch + 1}/{epochs}]  loss={loss.item():.7f}")
 
     # Re-zero V(0) after training drift
     problem.update_shift()

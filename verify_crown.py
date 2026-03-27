@@ -70,33 +70,21 @@ def _build_input_constraint(x, slab: torch.Tensor):
     return constraint
 
 
-def check_positive(
-    problem: LyapunovProblem, config, hole: float
-) -> dict[int, tuple[SolveResult, SolveResult]]:
-    """V(x) > 0 for all x in region, x != 0.
-
-    In practice, check outside of hyper rectangular hole with tessellated hyper rectangles.
-    A good default for the hole is 0.1% of the region size.
-    """
+def check_positive(problem: LyapunovProblem, config, slab: torch.Tensor) -> SolveResult:
+    """V(x) > 0 for all x in slab."""
     config.set(solver__bound_prop_method="forward+backward")  # propagate both ways
 
-    result = {}
     x = input_vars(problem.state_dim)
     y = output_vars(1)  # Lyapunov outputs scalar
-    slabs = _build_slabs(problem.region, hole)
-
-    for slab in slabs:
-        input_constraint = _build_input_constraint(x, slab)
-        output_constraint = y[0] > 0.0
-        spec = VerificationSpec.build_spec(
-            input_vars=x,
-            output_vars=y,
-            input_constraint=input_constraint,
-            output_constraint=output_constraint,
-        )
-        result[slab] = ABCrownSolver(spec, problem.nn_lyapunov, config=config).solve()
-
-    return result
+    input_constraint = _build_input_constraint(x, slab)
+    output_constraint = y[0] > 0.0
+    spec = VerificationSpec.build_spec(
+        input_vars=x,
+        output_vars=y,
+        input_constraint=input_constraint,
+        output_constraint=output_constraint,
+    )
+    return ABCrownSolver(spec, problem.nn_lyapunov, config=config).solve()
 
 
 class DecreaseNetwork(nn.Module):
@@ -119,35 +107,23 @@ class DecreaseNetwork(nn.Module):
         return torch.sum(dVdx * f_x, dim=1, keepdim=True)
 
 
-def check_decrease(
-    problem: LyapunovProblem, config, hole: float
-) -> dict[int, tuple[SolveResult, SolveResult]]:
-    """dot{V}(x) = DV(x)f(X) < 0 for all x in region, x != 0.
-
-    In practice, check outside of hyper rectangular hole with tessellated hyper rectangles.
-    A good default for the hole is 0.1% of the region size.
-    """
+def check_decrease(problem: LyapunovProblem, config, slab: torch.Tensor) -> SolveResult:
+    """dot{V}(x) = DV(x)f(X) < 0 for all x in slab."""
     config.set(model__with_jacobian=True)  # Needed for decrease condition
     config.set(solver__bound_prop_method="backward")  # no "forward" with JacobianOP
 
-    result = {}
     x = input_vars(problem.state_dim)
     y = output_vars(1)  # Lyapunov outputs scalar
-    slabs = _build_slabs(problem.region, hole)
-
-    for slab in slabs:
-        input_constraint = _build_input_constraint(x, slab)
-        output_constraint = y[0] < 0.0
-        spec = VerificationSpec.build_spec(
-            input_vars=x,
-            output_vars=y,
-            input_constraint=input_constraint,
-            output_constraint=output_constraint,
-        )
-        model = DecreaseNetwork(problem.dynamics, problem.nn_lyapunov)
-        result[slab] = ABCrownSolver(spec, model, config=config).solve()
-
-    return result
+    input_constraint = _build_input_constraint(x, slab)
+    output_constraint = y[0] < 0.0
+    spec = VerificationSpec.build_spec(
+        input_vars=x,
+        output_vars=y,
+        input_constraint=input_constraint,
+        output_constraint=output_constraint,
+    )
+    model = DecreaseNetwork(problem.dynamics, problem.nn_lyapunov)
+    return ABCrownSolver(spec, model, config=config).solve()
 
 
 def verify_lyapunov_nn(
@@ -155,6 +131,14 @@ def verify_lyapunov_nn(
     device: torch.device,
     hole: float = 0.001,
 ) -> dict[str, Any]:
+    """Verify all three Lyapunov conditions:
+        1. V(0) = 0
+        2. V(x) > 0, x != 0
+        3. dot V(x) < 0
+
+    Computes on a per-slab basis, positive and then decrease - using cache on GPU for decrease.
+    Clears GPU cache between slabs to save VRAM.
+    """
 
     problem.to(device)
 
@@ -169,20 +153,26 @@ def verify_lyapunov_nn(
         ConfigBuilder.from_defaults()
         .set(general__device=device)
         .set(attack__pgd_order="skip")  # Prevent early exit with false counterexample
-        .set(
-            general__enable_incomplete_verification=False
-        )  # Force complete (BaB) verification
+        .set(general__enable_incomplete_verification=False)  #  Force BaB complete
         .set(general__complete_verifier="bab")
         .set(bab__branching__method="sb")  # Split the input space since low dimension
         .set(bab__branching__input_split__enable=True)
-        .set(bab__timeout=3600)  # 1 hour per quadrant
+        .set(solver__batch_size=2048)  # A100-40GB safe ceiling
+        .set(solver__auto_enlarge_batch_size=False)
+        .set(bab__timeout=1800)  # 1/2 hour per quadrant
     )
 
-    # V(x) > 0 for x != 0, for all x in region
-    verification_result["positive"] = check_positive(problem, config, hole)
-
-    # dot{V(x)} = DV(x)F(X) < 0, for all x in region
-    verification_result["decrease"] = check_decrease(problem, config, hole)
+    slabs = _build_slabs(problem.region, hole)
+    positive_result = {}
+    decrease_result = {}
+    for slab in slabs:
+        # V(x) > 0 for x != 0
+        positive_result[id(slab)] = check_positive(problem, config, slab)
+        # dot{V(x)} = DV(x)f(x) < 0
+        decrease_result[id(slab)] = check_decrease(problem, config, slab)
+        torch.cuda.empty_cache()
+    verification_result["positive"] = positive_result
+    verification_result["decrease"] = decrease_result
 
     return verification_result
 
