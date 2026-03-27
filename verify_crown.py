@@ -34,6 +34,8 @@ def check_positive(
     In practice, check outside of rectangular hole with tesselated rectangles.
     A good default for the hole is 0.01% of the region size.
     """
+    config.set(solver__bound_prop_method="forward+backward")  # propagate both ways
+
     result = {}
     # Symbolic variables
     x = input_vars(problem.state_dim)
@@ -103,6 +105,9 @@ def check_decrease(
     In practice, check outside of rectangular hole with tesselated rectangles.
     A good default for the hole is 0.01% of the region size.
     """
+    config.set(model__with_jacobian=True)  # Needed for decrease condition
+    config.set(solver__bound_prop_method="backward")  # no "forward" with JacobianOP
+
     result = {}
     # Symbolic variables
     x = input_vars(problem.state_dim)
@@ -163,13 +168,10 @@ def verify_lyapunov_nn(
     config = (
         ConfigBuilder.from_defaults()
         .set(general__device=device)
-        .set(general__conv_mode="matrix")  # No convolutions
-        .set(model__with_jacobian=True)  # Needed for decrease condition
         .set(attack__pgd_order="skip")  # Prevent early exit with false counterexample
         .set(general__complete_verifier="bab")
         .set(bab__branching__method="sb")  # Split the input space since low dimension
         .set(bab__branching__input_split__enable=True)
-        .set(solver__bound_prop_method="backward")  # no "forward" with JacobianOP
         .set(bab__timeout=3200)
     )
 

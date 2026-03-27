@@ -38,7 +38,7 @@ class BilinearCoupledDynamics(nn.Module):
 
 
 class BilinearCoupledLyapunov(nn.Module):
-    def __init__(self, hidden_size: int = 5):
+    def __init__(self, hidden_size: int):
         """Single hidden layer, ReLU activation, output shape (N, 1).
 
         The attribute is named `.network` so hyperplane.py can access
@@ -64,7 +64,8 @@ class BilinearCoupledProblem(LyapunovProblem):
     def __init__(
         self,
         region: Tensor | None = None,
-        hidden_size: int = 30,
+        *,
+        hidden_size: int,
         eps: float = 0.1,
     ):
         if region is None:
@@ -76,6 +77,6 @@ class BilinearCoupledProblem(LyapunovProblem):
         )
 
 
-def make_problem(hidden_size: int = 30, **kwargs) -> LyapunovProblem:
+def make_problem(hidden_size: int, **kwargs) -> LyapunovProblem:
     """Factory function for the verification runner."""
     return BilinearCoupledProblem(hidden_size=hidden_size, **kwargs)

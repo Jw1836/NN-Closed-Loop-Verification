@@ -30,7 +30,7 @@ class LinearDecayDynamics(nn.Module):
 class L1NormLyapunov(nn.Module):
     """V(x) = sum_i (relu(x_i) + relu(-x_i)) = sum_i |x_i| = ||x||_1."""
 
-    def __init__(self, n: int = 2):
+    def __init__(self, n: int):
         super().__init__()
         w1 = torch.zeros(2 * n, n)
         for i in range(n):
@@ -48,16 +48,16 @@ class L1NormLyapunov(nn.Module):
 
 
 class LinearL1Problem(LyapunovProblem):
-    def __init__(self, n: int = 2, region: Tensor | None = None):
+    def __init__(self, hidden_size: int, region: Tensor | None = None):
         if region is None:
-            region = torch.full((n, 2), -1.0)
-            region[:, 1] = 1.0
+            region = torch.full((hidden_size, 2), -10.0)
+            region[:, 1] = 10.0
         super().__init__(
-            nn_lyapunov=L1NormLyapunov(n=n),
+            nn_lyapunov=L1NormLyapunov(n=hidden_size),
             dynamics=LinearDecayDynamics(),
             region=region,
         )
 
 
-def make_problem(n: int = 2, **kwargs) -> LyapunovProblem:
-    return LinearL1Problem(n=n, **kwargs)
+def make_problem(hidden_size: int = 2) -> LyapunovProblem:
+    return LinearL1Problem(hidden_size=hidden_size)

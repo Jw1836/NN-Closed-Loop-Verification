@@ -363,7 +363,27 @@ def plot_cex_history(checkpoint_dir: str, cex_history, problem: LyapunovProblem)
 
 def cmd_verify(args):
     mod = load_problem_module(args.problem_file)
-    problem = mod.make_problem()
+
+    # Determine hidden_size: explicit flag > inferred from checkpoint
+    hidden_size = args.hidden_size
+    ckpt = None
+    if args.checkpoint is not None:
+        path = args.checkpoint
+        if not os.path.isfile(path):
+            print(f"Error: checkpoint not found: {path}", file=sys.stderr)
+            sys.exit(1)
+        ckpt = torch.load(path, weights_only=False)
+        if hidden_size is None:
+            w = ckpt["model_state"].get("network.0.weight")
+            if w is not None:
+                hidden_size = w.shape[0]
+
+    kwargs = {} if hidden_size is None else {"hidden_size": hidden_size}
+    problem = mod.make_problem(**kwargs)
+
+    if ckpt is not None:
+        _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
+        print(f"Checkpoint loaded: {args.checkpoint}")
 
     problem.early_exit = args.early_exit
     problem.max_workers = args.max_workers
@@ -372,15 +392,6 @@ def cmd_verify(args):
     else:
         spans = problem.region[:, 1] - problem.region[:, 0]
         problem.hole = float(spans.min().item()) * 0.001
-
-    if args.checkpoint is not None:
-        path = args.checkpoint
-        if not os.path.isfile(path):
-            print(f"Error: checkpoint not found: {path}", file=sys.stderr)
-            sys.exit(1)
-        ckpt = torch.load(path, weights_only=False)
-        _load_model_state(problem.nn_lyapunov, ckpt["model_state"])
-        print(f"Checkpoint loaded: {path}")
 
     device = torch.device(args.device)
     problem.to(device)
@@ -623,6 +634,12 @@ def _add_common_args(parser: argparse.ArgumentParser):
         help="Exclusion radius around origin: positivity and decrease counterexamples within this ball are not required (default: 0.1%% of smallest region span)",
     )
     parser.add_argument(
+        "--hidden-size",
+        type=int,
+        default=None,
+        help="Hidden layer size in the Lyapunov net (inferred from checkpoint if not supplied)",
+    )
+    parser.add_argument(
         "--grid-pts",
         type=int,
         default=None,
@@ -665,12 +682,6 @@ def main():
         help="Train a Lyapunov network and run the verify/retrain loop",
     )
     _add_common_args(train_parser)
-    train_parser.add_argument(
-        "--hidden-size",
-        type=int,
-        default=None,
-        help="Override hidden layer size in the Lyapunov net",
-    )
     train_parser.add_argument(
         "--checkpoint-dir",
         default=None,

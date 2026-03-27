@@ -53,7 +53,7 @@ class PendulumDynamics(nn.Module):
 
 
 class PendulumLyapunov(nn.Module):
-    def __init__(self, hidden_size: int = 5):
+    def __init__(self, hidden_size: int):
         """Single hidden layer, ReLU activation, output shape (N, 1).
 
         The attribute is named `.network` so hyperplane.py can access
@@ -84,7 +84,8 @@ class PendulumProblem(LyapunovProblem):
     def __init__(
         self,
         region: Tensor | None = None,
-        hidden_size: int = 5,
+        *,
+        hidden_size: int,
         **kwargs: Any,
     ) -> None:
         import math
@@ -104,6 +105,6 @@ class PendulumProblem(LyapunovProblem):
         )
 
 
-def make_problem(hidden_size: int = 30, **kwargs) -> LyapunovProblem:
-    """Factory function for the CEGIS runner."""
+def make_problem(hidden_size: int, **kwargs) -> LyapunovProblem:
+    """Factory function for the verification runner."""
     return PendulumProblem(hidden_size=hidden_size, **kwargs)

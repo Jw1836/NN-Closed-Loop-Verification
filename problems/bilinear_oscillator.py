@@ -29,7 +29,7 @@ class BilinearDynamics(nn.Module):
 
 
 class BilinearLyapunov(nn.Module):
-    def __init__(self, hidden_size: int = 5):
+    def __init__(self, hidden_size: int):
         """Single hidden layer, ReLU activation, output shape (N, 1).
 
         The attribute is named `.network` so hyperplane.py can access
@@ -53,7 +53,7 @@ class BilinearProblem(LyapunovProblem):
     quickly so a moderate domain suffices.
     """
 
-    def __init__(self, region: Tensor | None = None, hidden_size: int = 30):
+    def __init__(self, region: Tensor | None = None, *, hidden_size: int):
         if region is None:
             region = torch.tensor([[-2.0, 2.0], [-2.0, 2.0]])
         super().__init__(
@@ -63,6 +63,6 @@ class BilinearProblem(LyapunovProblem):
         )
 
 
-def make_problem(hidden_size: int = 30, **kwargs) -> LyapunovProblem:
-    """Factory function for the CEGIS runner."""
+def make_problem(hidden_size: int, **kwargs) -> LyapunovProblem:
+    """Factory function for the verification runner."""
     return BilinearProblem(hidden_size=hidden_size, **kwargs)
