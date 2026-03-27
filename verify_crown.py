@@ -31,23 +31,31 @@ def _build_slabs(
 ) -> list[torch.Tensor]:
     """Build 2*N slabs tiling the region minus a hole around origin.
 
+    Dimensions are peeled in order: slab for dim d restricts dims 0..d-1
+    to the hole range (already covered), keeping dims d+1..N-1 at full range.
+    Overlap extends outward from the hole so adjacent slabs slightly overlap.
+
     Returns list of (state_dim, 2) tensors with [min, max] per dimension.
     """
+    state_dim = region.shape[0]
+    # Precompute hole half-width per dimension
+    h = [(region[d, 1].item() - region[d, 0].item()) * hole for d in range(state_dim)]
+
     slabs = []
-    for d in range(region.shape[0]):
-        d_min = region[d, 0].item()
-        d_max = region[d, 1].item()
-        h = (d_max - d_min) * hole
-
-        # Positive slab: x_d in [h - overlap, d_max]
-        pos_slab = region.clone()
-        pos_slab[d, 0] = h - overlap
-        slabs.append(pos_slab)
-
-        # Negative slab: x_d in [d_min, -h + overlap]
-        neg_slab = region.clone()
-        neg_slab[d, 1] = -h + overlap
-        slabs.append(neg_slab)
+    for d in range(state_dim):
+        for sign in (+1, -1):
+            slab = region.clone()
+            # Dims 0..d-1: restrict to hole range + overlap (already covered)
+            for prev in range(d):
+                slab[prev, 0] = -h[prev] - overlap
+                slab[prev, 1] = h[prev] + overlap
+            # Dim d: split at hole boundary
+            if sign == +1:
+                slab[d, 0] = h[d]
+            else:
+                slab[d, 1] = -h[d]
+            # Dims d+1..N-1: full range (already from region.clone())
+            slabs.append(slab)
 
     return slabs
 
@@ -67,7 +75,7 @@ def check_positive(
 ) -> dict[int, tuple[SolveResult, SolveResult]]:
     """V(x) > 0 for all x in region, x != 0.
 
-    In practice, check outside of rectangular hole with tessellated rectangles.
+    In practice, check outside of hyper rectangular hole with tessellated hyper rectangles.
     A good default for the hole is 0.1% of the region size.
     """
     config.set(solver__bound_prop_method="forward+backward")  # propagate both ways
@@ -116,7 +124,7 @@ def check_decrease(
 ) -> dict[int, tuple[SolveResult, SolveResult]]:
     """dot{V}(x) = DV(x)f(X) < 0 for all x in region, x != 0.
 
-    In practice, check outside of rectangular hole with tessellated rectangles.
+    In practice, check outside of hyper rectangular hole with tessellated hyper rectangles.
     A good default for the hole is 0.1% of the region size.
     """
     config.set(model__with_jacobian=True)  # Needed for decrease condition
