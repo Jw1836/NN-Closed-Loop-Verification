@@ -257,7 +257,7 @@ def cmd_verify(args):
         origin_cexs + spatial_cexs,
         polygons,
         plot_grid_pts,
-        f"{type(problem).__name__}: polygon tessellation + counterexamples",
+        f"{type(problem).__name__}: Lyapunov neural network and union of polytopes",
     )
 
 
@@ -397,7 +397,7 @@ def cmd_train(args):
         origin_cexs + spatial_cexs,
         final_polygons,
         plot_grid_pts,
-        "Final verification: polygon tessellation + counterexamples",
+        "Final verification: Lyapunov neural network and union of polytopes",
     )
     if not origin_cexs and not spatial_cexs:
         save_checkpoint(checkpoint_dir, "passed", problem)

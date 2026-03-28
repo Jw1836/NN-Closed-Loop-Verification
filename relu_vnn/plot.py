@@ -38,8 +38,10 @@ def plot_verification(
     )
     with torch.no_grad():
         V = problem.nn_lyapunov(plot_pts).numpy().reshape(x1g.shape)
-    ax.contourf(x1g, x2g, V, levels=20, cmap="viridis", alpha=0.5)
+    cf = ax.contourf(x1g, x2g, V, levels=20, cmap="viridis", alpha=0.5)
     ax.contour(x1g, x2g, V, levels=20, colors="white", linewidths=0.4, alpha=0.3)
+    cbar = fig.colorbar(cf, ax=ax)
+    cbar.set_label(r"$V_{nn}(\mathbf{x})$")
     for coords in polygons:
         xs = [c[0] for c in coords] + [coords[0][0]]
         ys = [c[1] for c in coords] + [coords[0][1]]
