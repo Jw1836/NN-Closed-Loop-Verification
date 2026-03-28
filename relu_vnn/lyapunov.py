@@ -197,117 +197,6 @@ def _check_cell_lie(args) -> dict[str, object]:
         }
 
 
-def _decrease_worker(
-    cell_queue, result_queue, W_matrix, B_vector, W_out_vec, dynamics, hole, early_exit
-):
-    """Worker process: pull cells from cell_queue, run decrease check, push results."""
-    while True:
-        item = cell_queue.get()
-        if item is None:  # sentinel
-            break
-        cell, cell_idx = item
-        result = _check_cell_lie(
-            (
-                cell,
-                cell_idx,
-                -1,
-                W_matrix,
-                B_vector,
-                W_out_vec,
-                dynamics,
-                hole,
-                early_exit,
-            )
-        )
-        result_queue.put(result)
-
-
-def _aggregate_decrease_results(
-    results: list[dict], n_cells: int, callback=None
-) -> dict:
-    """Aggregate per-cell decrease check results into a summary dict."""
-    violations: list[np.ndarray] = []
-    n_certified = 0
-    n_violated = 0
-
-    for r in results:
-        cell_idx = int(r["cell_idx"])  # type: ignore[arg-type]
-        outcome = str(r["outcome"])
-        bounds_str = str(r["bounds_str"])
-        elapsed = float(r["elapsed"])  # type: ignore[arg-type]
-
-        if outcome in ("shgo_certified", "zero_norm"):
-            n_certified += 1
-            logger.debug(
-                "[%d/%d] certified  %s  (%.3fs)",
-                cell_idx + 1,
-                n_cells,
-                bounds_str,
-                elapsed,
-            )
-        else:
-            n_violated += 1
-            if outcome == "zero_grad":
-                logger.debug(
-                    "[%d/%d] zero-grad violation  %s  (%.3fs)",
-                    cell_idx + 1,
-                    n_cells,
-                    bounds_str,
-                    elapsed,
-                )
-            elif outcome == "pre-check_violation":
-                logger.debug(
-                    "[%d/%d] pre-check violation  %s  v_dot_max=%.4g  (%d pts)  (%.3fs)",
-                    cell_idx + 1,
-                    n_cells,
-                    bounds_str,
-                    r["v_dot_max"],
-                    r["n_pts"],
-                    elapsed,
-                )
-            elif outcome == "shgo_violation":
-                logger.debug(
-                    "[%d/%d] shgo violation  %s  v_dot_max=%.4g  (%d pts)  (%.3fs)",
-                    cell_idx + 1,
-                    n_cells,
-                    bounds_str,
-                    r["v_dot_max"],
-                    r["n_pts"],
-                    elapsed,
-                )
-
-        violations.extend(r["violations"])
-
-        if callback is not None:
-            callback(
-                cell_idx,
-                n_cells,
-                {
-                    "bounds": r["bounds"],
-                    "grad_norm": r["grad_norm"],
-                    "outcome": outcome,
-                    "v_dot_max": r["v_dot_max"],
-                    "elapsed": elapsed,
-                },
-            )
-
-    logger.info(
-        "check_decrease done: %d/%d certified, %d/%d violated",
-        n_certified,
-        n_cells,
-        n_violated,
-        n_cells,
-    )
-    cex_array = np.vstack(violations) if violations else None
-    return {
-        "passed": cex_array is None,
-        "n_cells": n_cells,
-        "n_certified": n_certified,
-        "n_violations": n_violated,
-        "counterexamples": cex_array.tolist() if cex_array is not None else None,
-    }
-
-
 class LyapunovProblem:
     """A NN Lyapunov function, dynamics, and region of interest.
     This is collectively what is verified.
@@ -468,7 +357,7 @@ class LyapunovProblem:
             n_workers,
         )
         if n_workers > 1:
-            ctx = mp.get_context("fork")
+            ctx = mp.get_context("forkserver")
             with ctx.Pool(n_workers) as pool:
                 results = pool.map(_check_cell_lie, args_list)
         else:
@@ -477,7 +366,87 @@ class LyapunovProblem:
         # Move dynamics back to the original device
         self.dynamics.to(self.device)
 
-        return _aggregate_decrease_results(results, n_cells, callback)
+        # Aggregate results and print (preserves original output order)
+        violations: list[np.ndarray] = []
+        n_certified = 0
+        n_violated = 0
+
+        for r in results:
+            cell_idx = int(r["cell_idx"])  # type: ignore[arg-type]
+            outcome = str(r["outcome"])
+            bounds_str = str(r["bounds_str"])
+            elapsed = float(r["elapsed"])  # type: ignore[arg-type]
+
+            if outcome in ("shgo_certified", "zero_norm"):
+                n_certified += 1
+                logger.debug(
+                    "[%d/%d] certified  %s  (%.3fs)",
+                    cell_idx + 1,
+                    n_cells,
+                    bounds_str,
+                    elapsed,
+                )
+            else:
+                n_violated += 1
+                if outcome == "zero_grad":
+                    logger.debug(
+                        "[%d/%d] zero-grad violation  %s  (%.3fs)",
+                        cell_idx + 1,
+                        n_cells,
+                        bounds_str,
+                        elapsed,
+                    )
+                elif outcome == "pre-check_violation":
+                    logger.debug(
+                        "[%d/%d] pre-check violation  %s  v_dot_max=%.4g  (%d pts)  (%.3fs)",
+                        cell_idx + 1,
+                        n_cells,
+                        bounds_str,
+                        r["v_dot_max"],
+                        r["n_pts"],
+                        elapsed,
+                    )
+                elif outcome == "shgo_violation":
+                    logger.debug(
+                        "[%d/%d] shgo violation  %s  v_dot_max=%.4g  (%d pts)  (%.3fs)",
+                        cell_idx + 1,
+                        n_cells,
+                        bounds_str,
+                        r["v_dot_max"],
+                        r["n_pts"],
+                        elapsed,
+                    )
+
+            violations.extend(r["violations"])
+
+            if callback is not None:
+                callback(
+                    cell_idx,
+                    n_cells,
+                    {
+                        "bounds": r["bounds"],
+                        "grad_norm": r["grad_norm"],
+                        "outcome": outcome,
+                        "v_dot_max": r["v_dot_max"],
+                        "elapsed": elapsed,
+                    },
+                )
+
+        logger.info(
+            "check_decrease done: %d/%d certified, %d/%d violated",
+            n_certified,
+            n_cells,
+            n_violated,
+            n_cells,
+        )
+        cex_array = np.vstack(violations) if violations else None
+        return {
+            "passed": cex_array is None,
+            "n_cells": n_cells,
+            "n_certified": n_certified,
+            "n_violations": n_violated,
+            "counterexamples": cex_array.tolist() if cex_array is not None else None,
+        }
 
     def enumerate_cells(self) -> list[HalfspaceIntersection]:
         """Build the ReLU activation-pattern cell decomposition for this network and region."""
@@ -501,95 +470,6 @@ class LyapunovProblem:
         )
         logger.info("  done (%.3fs)  — %d cells", time.perf_counter() - t0, len(cells))
         return cells
-
-    def _verify_sequential(self) -> tuple[list, dict]:
-        """Enumerate all cells, then run decrease checks sequentially."""
-        cells = self.enumerate_cells()
-        decrease_result = self.check_decrease(cells)
-        return cells, decrease_result
-
-    def _verify_pipelined(self) -> tuple[list, dict]:
-        """Pipeline BFS enumeration with decrease checks via worker processes."""
-        from .hyperplane import (
-            extract_weights,
-            build_bbox_halfspaces,
-            enumerate_cells_bfs,
-        )
-
-        W_matrix, B_vector, W_out_vec = extract_weights(self.nn_lyapunov)
-        region_np = self.region.numpy()
-        bbox_hs = build_bbox_halfspaces(region_np)
-        dynamics_cpu = self.dynamics.cpu()
-
-        n_workers = self.max_workers
-        ctx = mp.get_context("fork")
-        cell_queue = ctx.Queue(maxsize=n_workers * 4)
-        result_queue = ctx.Queue()
-
-        # Start workers
-        workers = []
-        for _ in range(n_workers):
-            p = ctx.Process(
-                target=_decrease_worker,
-                args=(
-                    cell_queue,
-                    result_queue,
-                    W_matrix,
-                    B_vector,
-                    W_out_vec,
-                    dynamics_cpu,
-                    self.hole,
-                    self.early_exit,
-                ),
-            )
-            p.start()
-            workers.append(p)
-
-        # BFS enumeration (single-threaded in master), feeding cells to workers
-        cell_count = 0
-
-        def _on_cell(cell, idx):
-            nonlocal cell_count
-            cell_queue.put((cell, idx))
-            cell_count += 1
-
-        logger.info(
-            "Enumerating cells via BFS (pipelined with %d decrease workers)...",
-            n_workers,
-        )
-        t0 = time.perf_counter()
-        cells = enumerate_cells_bfs(
-            W_matrix,
-            B_vector,
-            bbox_hs,
-            region_np,
-            n_workers=1,
-            on_cell=_on_cell,
-        )
-        logger.info("  done (%.3fs)  — %d cells", time.perf_counter() - t0, len(cells))
-
-        # Send sentinels to terminate workers
-        for _ in range(n_workers):
-            cell_queue.put(None)
-
-        # Wait for workers to finish
-        for w in workers:
-            w.join()
-
-        # Move dynamics back
-        self.dynamics.to(self.device)
-
-        # Drain results
-        decrease_results = []
-        while not result_queue.empty():
-            decrease_results.append(result_queue.get())
-
-        logger.info(
-            "Checking decrease condition on %d cells with %d workers...",
-            len(cells),
-            n_workers,
-        )
-        return cells, _aggregate_decrease_results(decrease_results, len(cells))
 
     def verify(self) -> dict:
         """Run all three Lyapunov checks.
@@ -623,14 +503,8 @@ class LyapunovProblem:
         else:
             logger.info("Check passed!")
 
-        # Build the cell decomposition and run checks.
-        # When max_workers > 1, pipeline BFS enumeration with decrease checks:
-        # workers start checking cells before all cells are discovered.
-        if self.max_workers > 1:
-            cells, decrease_result = self._verify_pipelined()
-        else:
-            cells, decrease_result = self._verify_sequential()
-
+        # Build the cell decomposition for the next two checks.
+        cells = self.enumerate_cells()
         results["n_cells"] = len(cells)
         results["cells"] = cells
 
@@ -649,8 +523,11 @@ class LyapunovProblem:
         else:
             logger.info("Check passed!")
 
-        # Criteria 3: V_dot < 0 (already computed by _verify_pipelined/_verify_sequential)
-        results["decrease"] = decrease_result
+        # Criteria 3: V_dot < 0
+        logger.info("Checking decrease condition...")
+        t0 = time.perf_counter()
+        results["decrease"] = self.check_decrease(cells)
+        logger.info("  done (%.3fs)", time.perf_counter() - t0)
         if not results["decrease"]["passed"]:
             logger.info(
                 "Found %d counterexamples.", results["decrease"]["n_violations"]

@@ -23,6 +23,7 @@ import re
 import sys
 import time
 
+import numpy as np
 import torch
 from typing import cast
 
@@ -220,7 +221,8 @@ def cmd_verify(args):
         spans = problem.region[:, 1] - problem.region[:, 0]
         problem.hole = float(spans.min().item()) * 0.001
 
-    problem.to("cpu")
+    device = torch.device(args.device)
+    problem.to(device)
     problem.update_shift()
 
     n_params = sum(p.numel() for p in problem.nn_lyapunov.parameters())
@@ -230,6 +232,7 @@ def cmd_verify(args):
     )
     print(f"Problem:      {problem}")
     print(f"Lyapunov net: hidden_size={hidden_size}  params={n_params:,}")
+    print(f"Device:       {device}")
     print(
         f"Config:       early_exit={args.early_exit}  max_workers={args.max_workers}  hole={problem.hole}"
     )
@@ -410,6 +413,7 @@ def _add_common_args(parser: argparse.ArgumentParser):
         "problem_file",
         help="Path to a Python file defining make_problem() -> LyapunovProblem",
     )
+    parser.add_argument("--device", default="cpu", help="torch device (cpu, cuda, mps)")
     parser.add_argument(
         "--early-exit",
         action="store_true",
@@ -478,9 +482,6 @@ def main():
     )
     _add_common_args(train_parser)
     train_parser.add_argument(
-        "--device", default="cpu", help="torch device (cpu, cuda, mps)"
-    )
-    train_parser.add_argument(
         "--checkpoint-dir",
         default=None,
         help="Directory for checkpoints (default: checkpoints_<problem_name>)",
@@ -538,15 +539,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # On macOS, torch lazily initializes the MPS (Metal) framework on import.
-    # Forked children inherit that ObjC state and crash.  The ObjC runtime
-    # reads this env var at process start, so it must be set before Python
-    # runs.  Re-exec if it is not already present.
-    if (
-        sys.platform == "darwin"
-        and "verify" in sys.argv
-        and os.environ.get("OBJC_DISABLE_INITIALIZE_FORK_SAFETY") != "YES"
-    ):
-        os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
-        os.execv(sys.executable, [sys.executable, "-m", "relu_vnn"] + sys.argv[1:])
     main()

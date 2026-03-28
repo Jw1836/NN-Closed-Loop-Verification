@@ -11,7 +11,6 @@ Pipeline:
 import itertools
 import logging
 from collections import deque
-from collections.abc import Callable
 import numpy as np
 import torch
 from scipy.optimize import linprog
@@ -157,7 +156,6 @@ def enumerate_cells_bfs(
     bbox_hs: np.ndarray,
     region: np.ndarray,
     n_workers: int = 1,
-    on_cell: Callable | None = None,
 ) -> list[HalfspaceIntersection]:
     """Enumerate all non-empty cells of the ReLU hyperplane arrangement via BFS.
 
@@ -172,7 +170,7 @@ def enumerate_cells_bfs(
     number of possible activation patterns is ``2ⁿ``.
 
     The algorithm:
-      1. Evaluate the activation pattern at a seed.
+      1. Seed: evaluate the activation pattern at the domain centre.
       2. For each queued pattern, build its halfspace system and compute the
          cell vertices via ``scipy.spatial.HalfspaceIntersection``.
       3. Determine which ReLU hyperplanes are *tight* (touch a vertex of the
@@ -250,7 +248,7 @@ def enumerate_cells_bfs(
         # Experiments show decrease performance past 16 workers, at least in the 2k-4k cell space.
         n_workers = min(n_workers, 16)
 
-        ctx = mp.get_context("fork")
+        ctx = mp.get_context("forkserver")
         # Stream results as they arrive instead of draining the full queue per
         # wave.  As each geometry result returns we immediately discover its
         # neighbors and submit them to the executor, so workers stay busy
@@ -275,8 +273,6 @@ def enumerate_cells_bfs(
                     hs_obj, feasible = future.result()
                     if feasible and hs_obj is not None:
                         cells.append(hs_obj)
-                        if on_cell is not None:
-                            on_cell(hs_obj, len(cells) - 1)
                         _discover_neighbors(sigma, hs_obj.intersections)
                 _submit_queue()  # submit any neighbors just discovered
     else:
@@ -301,8 +297,6 @@ def enumerate_cells_bfs(
                 continue
 
             cells.append(hs_obj)
-            if on_cell is not None:
-                on_cell(hs_obj, len(cells) - 1)
             _discover_neighbors(sigma, raw_verts)
 
     # ── Sanity check: activation-pattern sampling ─────────────────────────
