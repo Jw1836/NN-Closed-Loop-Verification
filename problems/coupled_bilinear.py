@@ -22,7 +22,7 @@ from torch import nn, Tensor
 from relu_vnn import LyapunovProblem
 
 
-class BilinearCoupledDynamics(nn.Module):
+class CoupledBilinearDynamics(nn.Module):
     def __init__(self, eps: float = 0.1):
         super().__init__()
         self.eps = eps
@@ -37,7 +37,7 @@ class BilinearCoupledDynamics(nn.Module):
         return torch.stack([dx1, dx2, dx3, dx4], dim=1)
 
 
-class BilinearCoupledLyapunov(nn.Module):
+class CoupledBilinearLyapunov(nn.Module):
     def __init__(self, hidden_size: int):
         """Single hidden layer, ReLU activation, output shape (N, 1).
 
@@ -55,7 +55,7 @@ class BilinearCoupledLyapunov(nn.Module):
         return self.network(x) - self.shift  # shape (N, 1)
 
 
-class BilinearCoupledProblem(LyapunovProblem):
+class CoupledBilinearProblem(LyapunovProblem):
     """Coupled Bilinear Oscillators problem.
 
     Default region [-2, 2]^4.
@@ -71,12 +71,12 @@ class BilinearCoupledProblem(LyapunovProblem):
         if region is None:
             region = torch.tensor([[-2.0, 2.0], [-2.0, 2.0], [-2.0, 2.0], [-2.0, 2.0]])
         super().__init__(
-            nn_lyapunov=BilinearCoupledLyapunov(hidden_size=hidden_size),
-            dynamics=BilinearCoupledDynamics(eps=eps),
+            nn_lyapunov=CoupledBilinearLyapunov(hidden_size=hidden_size),
+            dynamics=CoupledBilinearDynamics(eps=eps),
             region=region,
         )
 
 
 def make_problem(hidden_size: int, **kwargs) -> LyapunovProblem:
     """Factory function for the verification runner."""
-    return BilinearCoupledProblem(hidden_size=hidden_size, **kwargs)
+    return CoupledBilinearProblem(hidden_size=hidden_size, **kwargs)

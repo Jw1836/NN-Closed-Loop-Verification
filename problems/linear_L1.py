@@ -50,8 +50,8 @@ class L1NormLyapunov(nn.Module):
 class LinearL1Problem(LyapunovProblem):
     def __init__(self, hidden_size: int, region: Tensor | None = None):
         if region is None:
-            region = torch.full((hidden_size, 2), -10.0)
-            region[:, 1] = 10.0
+            region = torch.full((hidden_size, 2), -3.0)
+            region[:, 1] = 3.0
         super().__init__(
             nn_lyapunov=L1NormLyapunov(n=hidden_size),
             dynamics=LinearDecayDynamics(),
