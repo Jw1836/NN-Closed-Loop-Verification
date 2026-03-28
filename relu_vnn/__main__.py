@@ -23,6 +23,8 @@ import re
 import sys
 import time
 
+import numpy as np
+
 import torch
 from typing import cast
 
@@ -119,7 +121,18 @@ def _unpack_verify(
                 spatial_cexs.append(tuple(float(v) for v in row))
 
     cells = cast(list[HalfspaceIntersection], results.get("cells", []))
-    cell_coords = [cell.intersections.tolist() for cell in cells]
+    cell_coords = []
+    for cell in cells:
+        pts = cell.intersections  # all pairwise halfspace boundary intersections
+        hs = cell.halfspaces  # each row: [A | b] with Ax + b <= 0
+        residuals = pts @ hs[:, :-1].T + hs[:, -1]  # (N_pts, N_hs)
+        feasible = np.all(residuals <= 1e-6, axis=1)
+        fpts = pts[feasible]
+        if len(fpts) >= 2:
+            centroid = fpts.mean(axis=0)
+            angles = np.arctan2(fpts[:, 1] - centroid[1], fpts[:, 0] - centroid[0])
+            fpts = fpts[np.argsort(angles)]
+        cell_coords.append(fpts.tolist())
     return origin_cexs, spatial_cexs, cell_coords
 
 

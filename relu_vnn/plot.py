@@ -42,10 +42,15 @@ def plot_verification(
     ax.contour(x1g, x2g, V, levels=20, colors="white", linewidths=0.4, alpha=0.3)
     cbar = fig.colorbar(cf, ax=ax)
     cbar.set_label(r"$V_{nn}(\mathbf{x})$")
-    for coords in polygons:
-        xs = [c[0] for c in coords] + [coords[0][0]]
-        ys = [c[1] for c in coords] + [coords[0][1]]
-        ax.plot(xs, ys, "k-", linewidth=0.6, alpha=0.5)
+    n_cells = len(polygons)
+    cell_cmap = plt.colormaps["hsv"]
+    for i, coords in enumerate(polygons):
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        color = cell_cmap(i / max(n_cells, 1))
+        ax.plot(
+            xs + [xs[0]], ys + [ys[0]], color=color, linewidth=1.5, alpha=0.9, zorder=2
+        )
     if counterexamples:
         cx = [p[0] for p in counterexamples]
         cy = [p[1] for p in counterexamples]

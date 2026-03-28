@@ -540,8 +540,11 @@ class LyapunovProblem:
         results["decrease"] = self.check_decrease(cells)
         logger.info("  done (%.3fs)", time.perf_counter() - t0)
         if not results["decrease"]["passed"]:
+            n_dec_pts = len(results["decrease"]["counterexamples"])
             logger.info(
-                "Found %d counterexamples.", results["decrease"]["n_violations"]
+                "Found %d violated cells (%d counterexample points).",
+                results["decrease"]["n_violations"],
+                n_dec_pts,
             )
         else:
             logger.info("Check passed!")
@@ -556,6 +559,13 @@ class LyapunovProblem:
                 logger.info("  %s: PASSED", key)
             elif key == "origin":
                 logger.info("  %s: FAILED (V(0) = %.6g)", key, r["v0"])
+            elif key == "decrease":
+                logger.info(
+                    "  %s: FAILED with %d violated cells (%d counterexample points)",
+                    key,
+                    r["n_violations"],
+                    len(r["counterexamples"]),
+                )
             else:
                 logger.info(
                     "  %s: FAILED with %d counterexamples", key, r["n_violations"]
