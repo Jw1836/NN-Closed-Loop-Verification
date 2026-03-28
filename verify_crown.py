@@ -168,6 +168,7 @@ def verify_lyapunov_nn(
     for slab in slabs:
         # V(x) > 0 for x != 0
         positive_result[id(slab)] = check_positive(problem, config, slab)
+        torch.cuda.empty_cache()
         # dot{V(x)} = DV(x)f(x) < 0
         decrease_result[id(slab)] = check_decrease(problem, config, slab)
         torch.cuda.empty_cache()
