@@ -358,9 +358,21 @@ class LyapunovProblem:
         if n_workers > 1:
             ctx = mp.get_context("forkserver")
             with ctx.Pool(n_workers) as pool:
-                results = pool.map(_check_cell_lie, args_list)
+                if self.early_exit:
+                    results = []
+                    for r in pool.imap_unordered(_check_cell_lie, args_list):
+                        results.append(r)
+                        if r["violations"]:
+                            pool.terminate()
+                            break
+                else:
+                    results = pool.map(_check_cell_lie, args_list)
         else:
-            results = [_check_cell_lie(a) for a in args_list]
+            results = []
+            for a in args_list:
+                results.append(_check_cell_lie(a))
+                if self.early_exit and results[-1]["violations"]:
+                    break
 
         # Move dynamics back to the original device
         self.dynamics.to(self.device)
