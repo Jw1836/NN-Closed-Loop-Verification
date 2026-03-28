@@ -24,7 +24,7 @@ def _check_cell_lie(args) -> dict[str, object]:
     is thread/process-safe.
     """
     from .hyperplane import align_basis, analytic_gradient
-    from scipy.optimize import shgo, OptimizeResult
+    from scipy.optimize import shgo, OptimizeResult, LinearConstraint
 
     (
         cell,
@@ -118,19 +118,19 @@ def _check_cell_lie(args) -> dict[str, object]:
     A_hs = np.asarray(cell.halfspaces[:, :-1], dtype=np.float64)
     b_hs = np.asarray(cell.halfspaces[:, -1], dtype=np.float64)
     hole_sq = float(hole) ** 2
-    constraints = [
-        {
-            "type": "ineq",
-            "fun": lambda x: -A_hs @ x - b_hs,
-            "jac": lambda _x: -A_hs,
-        },
-        {
-            # Exclude the ball of radius hole: ||x||^2 - hole^2 >= 0
-            "type": "ineq",
-            "fun": lambda x: float(np.dot(x, x)) - hole_sq,
-            "jac": lambda x: 2.0 * np.asarray(x, dtype=np.float64),
-        },
-    ]
+    # A_hs @ x + b_hs <= 0  ↔  A_hs @ x <= -b_hs
+    constraints: list = [LinearConstraint(A_hs, lb=-np.inf, ub=-b_hs)]  # type: ignore[arg-type]
+    # Only exclude the origin ball if the bounding box is close enough to the origin
+    closest_to_origin = np.clip(np.zeros(bounds.shape[0]), bounds[:, 0], bounds[:, 1])
+    if float(np.dot(closest_to_origin, closest_to_origin)) < hole_sq:
+        constraints.append(
+            {
+                # Exclude the ball of radius hole: ||x||^2 - hole^2 >= 0
+                "type": "ineq",
+                "fun": lambda x: float(np.dot(x, x)) - hole_sq,
+                "jac": lambda x: 2.0 * np.asarray(x, dtype=np.float64),
+            }
+        )
 
     q1_tensor = torch.tensor(q1, dtype=torch.float32)
 
@@ -151,8 +151,7 @@ def _check_cell_lie(args) -> dict[str, object]:
             bounds=bounds.tolist(),
             constraints=constraints,
             sampling_method="simplicial",
-            options={"minimize_every_iter": True, "maxiter": 20}
-            | ({"f_min": 0.0} if early_exit else {}),
+            options={"minimize_every_iter": True, "maxiter": 20, "f_min": 0.0},
             minimizer_kwargs={"method": "SLSQP", "jac": True},
         )
 
